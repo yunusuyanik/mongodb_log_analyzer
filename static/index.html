@@ -1,0 +1,2311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>MongoDB Log Analyzer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#f4f5f7;color:#1c2027;font-family:'Inter',system-ui,-apple-system,sans-serif;font-size:12px;line-height:1.5;-webkit-font-smoothing:antialiased;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:4px;}
+::-webkit-scrollbar-thumb:hover{background:#9ca3af;}
+#pre-load{position:fixed;inset:0;background:#f4f5f7;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;z-index:9999;}
+.spin{width:22px;height:22px;border-radius:50%;border:2px solid #e5e7eb;border-top-color:#3b82f6;animation:sp .7s linear infinite;}
+@keyframes sp{to{transform:rotate(360deg);}}
+table{border-collapse:collapse;width:100%;}
+button{cursor:pointer;}
+select,input{font-family:inherit;}
+</style>
+</head>
+<body>
+<div id="pre-load"><div class="spin"></div><p style="color:#aeaeb2;font-size:11px;letter-spacing:.02em;font-weight:500;">Loading…</p></div>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useContext, createContext } = React;
+
+// ─── ECharts wrapper ────────────────────────────────────────────────────────
+const EChart = ({ option, style, height = 200 }) => {
+  const ref = React.useRef(null);
+  const inst = React.useRef(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    inst.current = echarts.init(ref.current, null, { renderer: 'canvas' });
+    return () => { inst.current?.dispose(); inst.current = null; };
+  }, []);
+  useEffect(() => {
+    inst.current?.setOption(option, { notMerge: true });
+  }, [option]);
+  useEffect(() => {
+    const ro = new ResizeObserver(() => inst.current?.resize());
+    if (ref.current) ro.observe(ref.current);
+    return () => ro.disconnect();
+  }, []);
+  // Escape key resets zoom when chart container (or child) is focused
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const onKey = e => {
+      if (e.key === 'Escape' && inst.current) {
+        inst.current.dispatchAction({ type: 'dataZoom', start: 0, end: 100 });
+      }
+    };
+    el.setAttribute('tabindex', '0');
+    el.addEventListener('keydown', onKey);
+    return () => el.removeEventListener('keydown', onKey);
+  }, []);
+  return <div ref={ref} style={{ width: '100%', height, outline: 'none', ...style }} />;
+};
+
+// ─── Shared ECharts zoom config ──────────────────────────────────────────────
+const ZOOM_CFG = {
+  dataZoom: [
+    { type: 'inside', start: 0, end: 100, zoomOnMouseWheel: true, moveOnMouseMove: true },
+  ],
+};
+
+// ─── Timezone context ────────────────────────────────────────────────────────
+const TzCtx = createContext({useUTC: false, logTz: null});
+
+// ─── Design tokens ──────────────────────────────────────────────────────────
+const C = {
+  bg:      '#f4f5f7',
+  surface: '#ffffff',
+  surface2:'#f8f9fb',
+  border:  '#e2e5e9',
+  border2: '#ebeef2',
+  text:    '#1c2027',
+  sub:     '#374151',
+  muted:   '#6b7280',
+  faint:   '#9ca3af',
+  blue:    '#3b82f6',
+  sky:     '#0ea5e9',
+  green:   '#16a34a',
+  lime:    '#22c55e',
+  amber:   '#d97706',
+  orange:  '#ea580c',
+  red:     '#ef4444',
+  rose:    '#f43f5e',
+  violet:  '#8b5cf6',
+  teal:    '#0891b2',
+  cyan:    '#06b6d4',
+  pink:    '#ec4899',
+};
+const PAL = ['#3b82f6','#16a34a','#ef4444','#d97706','#8b5cf6','#0891b2','#f43f5e','#06b6d4','#22c55e','#ea580c'];
+const GRID = '#f3f4f6';
+const TIP = {
+  backgroundColor:'#1c2027',
+  border:'none',
+  borderRadius:6,
+  fontSize:11,
+  padding:'7px 11px',
+  color:'#f3f4f6',
+  boxShadow:'0 4px 16px rgba(0,0,0,.2)',
+};
+
+// ─── Utils ──────────────────────────────────────────────────────────────────
+const nf = new Intl.NumberFormat();
+const N  = v => v == null ? '—' : nf.format(Math.round(+v));
+const F1 = v => v == null ? '—' : (+v).toFixed(1);
+const ms = v => {
+  if (v == null || +v === 0) return '—';
+  const n = +v;
+  if (n >= 60000) return (n/60000).toFixed(1)+'m';
+  if (n >= 1000)  return (n/1000).toFixed(2)+'s';
+  return N(n)+'ms';
+};
+const bytes = v => {
+  if (!v || +v === 0) return '—';
+  const n = +v;
+  if (n >= 1048576) return (n/1048576).toFixed(1)+' MB';
+  if (n >= 1024)    return (n/1024).toFixed(1)+' KB';
+  return N(n)+' B';
+};
+// Detect the UTC offset string from a raw ISO timestamp (e.g. "+03:00" or "Z")
+function detectTzOffset(isoStr) {
+  if(!isoStr||isoStr.startsWith('0001')) return null;
+  // Match +HH:MM or -HH:MM at end, or Z
+  const m = isoStr.match(/([+-]\d{2}:\d{2}|Z)$/);
+  if(!m) return null;
+  return m[1] === 'Z' ? '+00:00' : m[1];
+}
+// Format offset "+03:00" → "UTC+3" style label
+function fmtOffset(offset) {
+  if(!offset||offset==='+00:00') return 'UTC';
+  const sign = offset[0];
+  const [h,m] = offset.slice(1).split(':').map(Number);
+  return m ? `UTC${sign}${h}:${String(m).padStart(2,'0')}` : `UTC${sign}${h}`;
+}
+function fmtDate(s, useUTC){
+  if(!s||s.startsWith('0001'))return'—';
+  try{
+    const tz = useUTC ? 'UTC' : undefined;
+    return new Date(s).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZone:tz});
+  }catch{return s;}
+}
+function fmtHour(s, useUTC){
+  if(!s)return s;
+  try{
+    const tz = useUTC ? 'UTC' : undefined;
+    return new Date(s+':00:00Z').toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',timeZone:tz});
+  }catch{return s;}
+}
+function fmtMin(s, useUTC){
+  if(!s)return s;
+  try{
+    const tz = useUTC ? 'UTC' : undefined;
+    return new Date(s+':00Z').toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',timeZone:tz});
+  }catch{return s;}
+}
+function trunc(s,n){return s&&s.length>n?s.slice(0,n)+'…':s;}
+
+function highlightJson(raw) {
+  if (!raw) return '<span style="color:#9ca3af">—</span>';
+  let txt = raw;
+  try { txt = JSON.stringify(JSON.parse(raw), null, 2); } catch {}
+  txt = txt.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return txt.replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    m => {
+      if(/^"/.test(m)) return /:$/.test(m)
+        ? `<span style="color:#93c5fd">${m}</span>`
+        : `<span style="color:#86efac">${m}</span>`;
+      if(/true|false/.test(m)) return `<span style="color:#a78bfa">${m}</span>`;
+      if(/null/.test(m))       return `<span style="color:#fca5a5">${m}</span>`;
+      return `<span style="color:#fcd34d">${m}</span>`;
+    }
+  );
+}
+
+// ─── Primitives ─────────────────────────────────────────────────────────────
+const Panel = ({title, sub, action, children, pad=true}) => (
+  <div style={{
+    background:C.surface,
+    border:`1px solid ${C.border}`,
+    borderRadius:6,
+    overflow:'hidden',
+  }}>
+    {title&&(
+      <div style={{
+        display:'flex',alignItems:'center',justifyContent:'space-between',
+        padding:'10px 16px',borderBottom:`1px solid ${C.border2}`,minHeight:38,
+      }}>
+        <div style={{display:'flex',alignItems:'baseline',gap:8}}>
+          <span style={{fontSize:12,fontWeight:600,color:C.text}}>{title}</span>
+          {sub&&<span style={{fontSize:11,color:C.faint,fontWeight:400}}>{sub}</span>}
+        </div>
+        {action}
+      </div>
+    )}
+    {pad ? <div style={{padding:'12px 16px'}}>{children}</div> : children}
+  </div>
+);
+
+const Stat = ({label, value, sub, accent=C.blue, mono=false}) => (
+  <div style={{
+    background:C.surface,
+    border:`1px solid ${C.border}`,
+    borderRadius:6,
+    padding:'12px 16px',
+  }}>
+    <div style={{fontSize:10,fontWeight:500,color:C.faint,marginBottom:4,textTransform:'uppercase',letterSpacing:'.05em'}}>{label}</div>
+    <div style={{fontSize:20,fontWeight:700,color:accent,lineHeight:1,fontVariantNumeric:'tabular-nums',fontFamily:mono?'ui-monospace,monospace':undefined}}>{value}</div>
+    {sub&&<div style={{fontSize:10,color:C.faint,marginTop:4}}>{sub}</div>}
+  </div>
+);
+
+const Tag = ({children, color=C.muted, bg}) => (
+  <span style={{
+    display:'inline-flex',alignItems:'center',padding:'2px 7px',borderRadius:4,
+    fontSize:10,fontWeight:500,
+    background: bg || color+'14',
+    color: color,
+    border:`1px solid ${color}22`,
+  }}>{children}</span>
+);
+
+const SevBadge = ({s}) => {
+  const m={F:[C.red,'#fef2f2'],E:[C.red,'#fef2f2'],W:[C.amber,'#fefce8'],I:[C.blue,'#eff6ff']};
+  const [fg,bg]=(m[s]||[C.muted,'#f9fafb']);
+  return <span style={{background:bg,color:fg,padding:'1px 5px',borderRadius:3,fontSize:10,fontWeight:700}}>{s||'?'}</span>;
+};
+
+const PlanBadge = ({plan, copyable=false}) => {
+  const [copied, setCopied] = useState(false);
+  if(!plan) return <span style={{color:C.faint}}>—</span>;
+  const u=plan.toUpperCase();
+  const [bg,fg,br]=u.startsWith('COLLSCAN')
+    ? ['#fef2f2',C.red,'#fecaca']
+    : u.startsWith('IXSCAN')
+    ? ['#f0fdf4',C.green,'#bbf7d0']
+    : ['#f9fafb',C.muted,'#e5e7eb'];
+  const handleClick = copyable ? (e) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(plan).catch(()=>{});
+    setCopied(true);
+    setTimeout(()=>setCopied(false), 1400);
+  } : undefined;
+  return (
+    <span
+      onClick={handleClick}
+      title={copyable ? (copied ? 'Copied!' : 'Click to copy: '+plan) : plan}
+      style={{
+        background: copied ? '#f0fdf4' : bg,
+        color: copied ? C.green : fg,
+        border:`1px solid ${copied ? '#bbf7d0' : br}`,
+        padding:'1px 6px',borderRadius:3,fontSize:10,fontWeight:600,
+        fontFamily:'ui-monospace,monospace',display:'inline-block',
+        maxWidth:130,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',
+        verticalAlign:'middle',
+        cursor: copyable ? 'pointer' : undefined,
+        userSelect: copyable ? 'none' : undefined,
+        transition:'background .15s,color .15s,border-color .15s',
+      }}
+    >{copied ? 'Copied!' : plan}</span>
+  );
+};
+
+const EvBadge = ({type}) => {
+  const m={
+    election_won:'#16a34a #f0fdf4 #bbf7d0',election_start:'#2563eb #eff6ff #bfdbfe',
+    election:'#2563eb #eff6ff #bfdbfe',stepdown:'#dc2626 #fef2f2 #fecaca',
+    primary_change:'#16a34a #f0fdf4 #bbf7d0',secondary_change:'#0891b2 #ecfeff #a5f3fc',
+    heartbeat_error:'#dc2626 #fef2f2 #fecaca',heartbeat:'#6b7280 #f9fafb #e5e7eb',
+    config_change:'#5b7af8 #eef1ff #c7d2fe',initial_sync:'#d97706 #fffbeb #fde68a',
+    rollback:'#be123c #fff1f2 #fecdd3',repl_other:'#6b7280 #f9fafb #e5e7eb',
+  };
+  const [fg,bg,br]=(m[type]||'#6b7280 #f9fafb #e5e7eb').split(' ');
+  const label=type.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+  return <span style={{background:bg,color:fg,border:`1px solid ${br}`,padding:'1px 6px',borderRadius:3,fontSize:10,fontWeight:500}}>{label}</span>;
+};
+
+const IneffBadge = ({v}) => {
+  if(v==null||+v===0) return <span style={{color:C.faint}}>—</span>;
+  const color=v>1000?C.red:v>100?C.amber:v>20?C.orange:C.green;
+  return(
+    <span style={{display:'inline-flex',alignItems:'center',gap:5}}>
+      <span style={{fontWeight:600,color,fontVariantNumeric:'tabular-nums'}}>{F1(v)}</span>
+      {v>1000&&<Tag color={C.red}>No index?</Tag>}
+    </span>
+  );
+};
+
+const Dot = ({color,size=6}) => (
+  <span style={{display:'inline-block',width:size,height:size,borderRadius:'50%',background:color,flexShrink:0}}/>
+);
+
+// ─── Tooltips ───────────────────────────────────────────────────────────────
+const TipRow = ({color,label,value}) => (
+  <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:2}}>
+    <Dot color={color}/>
+    <span style={{color:C.muted,flex:1,fontSize:11}}>{label}</span>
+    <span style={{fontWeight:600,color:C.text,fontVariantNumeric:'tabular-nums',fontSize:11}}>{value}</span>
+  </div>
+);
+
+const HourlyTip = ({active,payload,label}) => {
+  if(!active||!payload?.length)return null;
+  const colors={errors:C.red,warns:C.amber,slow:C.teal,total:C.faint};
+  return(
+    <div style={TIP}>
+      <div style={{fontSize:10,fontWeight:600,color:C.muted,marginBottom:5}}>{label}</div>
+      {payload.map((p,i)=><TipRow key={i} color={colors[p.dataKey]||p.color} label={p.name} value={N(p.value)}/>)}
+    </div>
+  );
+};
+
+
+// ─── Mini sparkline card ────────────────────────────────────────────────────
+const MiniSpark = ({ title, data, dataKey, color, height = 56, fmtVal }) => {
+  const vals = (data || []).map(d => d[dataKey] ?? 0);
+  const labels = (data || []).map(d => d.label ?? '');
+  const peak = Math.max(...vals, 0);
+  const fmt = fmtVal || (v => v.toLocaleString());
+  const option = useMemo(() => ({
+    animation: false,
+    grid: { top: 2, right: 0, bottom: 2, left: 0 },
+    xAxis: { type: 'category', data: labels, show: false },
+    yAxis: { type: 'value', show: false },
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      backgroundColor: '#1c2027',
+      borderWidth: 0,
+      padding: [6, 10],
+      textStyle: { color: '#f3f4f6', fontSize: 11 },
+      axisPointer: { type: 'line', lineStyle: { color: 'rgba(150,150,150,0.3)', type: 'dashed', width: 1 } },
+      formatter: p => `<span style="color:#9ca3af">${p[0]?.name}:</span> <b style="color:${color}">${fmt(p[0]?.value??0)}</b>`,
+    },
+    series: [{
+      type: 'line', data: vals, smooth: false, symbol: 'none',
+      lineStyle: { color, width: 1.5 },
+      areaStyle: { color: { type:'linear',x:0,y:0,x2:0,y2:1,
+        colorStops:[{offset:0,color:color+'33'},{offset:1,color:color+'00'}] } },
+    }],
+  }), [vals.join(','), labels.join(','), color]);
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius:6, padding: '10px 12px' }}>
+      <div style={{ fontSize: 9, fontWeight: 500, color: C.faint, marginBottom: 6,
+        textTransform: 'uppercase', letterSpacing: '.06em' }}>{title}</div>
+      <div style={{fontSize:20,fontWeight:700,color,fontVariantNumeric:'tabular-nums',marginBottom:6,lineHeight:1}}>{fmt(peak)}</div>
+      <EChart option={option} height={height} />
+    </div>
+  );
+};
+
+// ─── Shared activity chart ──────────────────────────────────────────────────
+const HourlyChart = ({ data, markEvents=[], useUTC, height=200 }) => {
+  const rows = data || [];
+  const isPerMin = rows.length > 0 && rows[0].hour && rows[0].hour.length > 13;
+  const fmtLabel = s => isPerMin ? fmtMin(s, useUTC) : fmtHour(s, useUTC);
+
+  const labels   = rows.map(h => fmtLabel(h.hour));
+  const errVals  = rows.map(h => h.errors||0);
+  const warnVals = rows.map(h => h.warns||0);
+  const slowVals = rows.map(h => h.slow||0);
+
+  const option = useMemo(()=>{
+    if(!rows.length) return null;
+    const fmtMark = ts => {
+      if(!ts) return '';
+      try {
+        const d = new Date(ts);
+        const key = d.getUTCFullYear()+'-'+
+          String(d.getUTCMonth()+1).padStart(2,'0')+'-'+
+          String(d.getUTCDate()).padStart(2,'0')+('T')+
+          String(d.getUTCHours()).padStart(2,'0')+':'+
+          String(d.getUTCMinutes()).padStart(2,'0');
+        return fmtLabel(key);
+      } catch { return ''; }
+    };
+    const critMarks = markEvents.filter(e=>e.severity==='critical')
+      .map(e=>({xAxis:fmtMark(e.timestamp),lineStyle:{color:'#ef444440',width:1,type:'dashed'},label:{show:false}}));
+    const warnMarks = markEvents.filter(e=>e.severity==='warning'&&e.type!=='shutdown_start')
+      .map(e=>({xAxis:fmtMark(e.timestamp),lineStyle:{color:'#d9770630',width:1,type:'dashed'},label:{show:false}}));
+    return {
+      animation:false,
+      grid:{top:8,right:12,bottom:22,left:40},
+      xAxis:{type:'category',data:labels,axisLine:{show:false},axisTick:{show:false},
+        axisLabel:{fontSize:9,color:C.faint,interval:'auto'}},
+      yAxis:{type:'value',axisLine:{show:false},axisTick:{show:false},minInterval:1,
+        splitLine:{lineStyle:{color:GRID,type:'dashed'}},axisLabel:{fontSize:9,color:C.faint}},
+      ...ZOOM_CFG,
+      tooltip:{
+        trigger:'axis',
+        confine:true,
+        axisPointer:{type:'line',lineStyle:{color:'rgba(150,150,150,0.25)',type:'dashed',width:1}},
+        backgroundColor:'#1c2027',
+        borderWidth:0,
+        padding:[6,10],
+        textStyle:{color:'#f3f4f6',fontSize:11},
+        formatter:p=>{
+          const pts = p.filter(s=>s.value>0).map(s=>`<div style="display:flex;align-items:center;gap:6px;margin-top:3px"><span style="width:7px;height:7px;border-radius:50%;background:${s.color};display:inline-block;flex-shrink:0"></span><span style="color:#9ca3af">${s.seriesName}:</span><b style="color:${s.color};margin-left:4px">${s.value}</b></div>`).join('');
+          return `<div style="color:#9ca3af;font-size:10px;margin-bottom:2px">${p[0]?.name}</div>${pts||'<div style="color:#6b7280;font-size:10px">No events</div>'}`;
+        },
+      },
+      series:[
+        {name:'Errors',  type:'line',data:errVals, smooth:false,symbol:'none',
+          lineStyle:{color:C.red,width:1.5},  areaStyle:{color:C.red+'18'},
+          markLine:{silent:true,symbol:'none',data:critMarks}},
+        {name:'Warnings',type:'line',data:warnVals,smooth:false,symbol:'none',
+          lineStyle:{color:C.amber,width:1.5},areaStyle:{color:C.amber+'18'},
+          markLine:{silent:true,symbol:'none',data:warnMarks}},
+        {name:'Slow',    type:'line',data:slowVals,smooth:false,symbol:'none',
+          lineStyle:{color:C.teal,width:1.5}, areaStyle:{color:C.teal+'18'}},
+      ],
+    };
+  }, [rows.length, markEvents.length, useUTC]);
+
+  if(!option) return <div style={{height,display:'flex',alignItems:'center',justifyContent:'center',color:C.faint}}>No data</div>;
+  return (
+    <div style={{padding:'12px 16px 4px'}}>
+      <EChart option={option} height={height}/>
+      <div style={{display:'flex',gap:14,paddingTop:6,paddingLeft:4}}>
+        {[{name:'Errors',color:C.red},{name:'Warnings',color:C.amber},{name:'Slow',color:C.teal}].map(s=>(
+          <span key={s.name} style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:10,color:C.muted}}>
+            <span style={{width:18,height:2,background:s.color,display:'inline-block',borderRadius:1}}/>
+            {s.name}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ─── Duration distribution blocks ───────────────────────────────────────────
+const DurationDist = ({data}) => {
+  const max   = Math.max(...(data||[]).map(d=>d.count),1);
+  const total = (data||[]).reduce((s,d)=>s+d.count,0);
+  const color = min => min>=5000?C.red:min>=2000?C.orange:min>=1000?C.amber:min>=250?C.blue:C.green;
+  if(!data||data.length===0) return <div style={{padding:16,color:C.faint,textAlign:'center'}}>No data</div>;
+  return(
+    <div style={{display:'flex',gap:4,alignItems:'flex-end',padding:'12px 14px 10px'}}>
+      {data.map((b,i)=>{
+        const pct = total>0?b.count/total*100:0;
+        const h   = Math.max(4, Math.round(b.count/max*80));
+        const c   = color(b.min);
+        return(
+          <div key={i} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',minWidth:0}}>
+            <div style={{width:'100%',height:84,display:'flex',flexDirection:'column',justifyContent:'flex-end'}}>
+              <div style={{width:'100%',height:h,background:c,borderRadius:'2px 2px 0 0',opacity:.85}}/>
+            </div>
+            <div style={{width:'100%',height:1,background:c+'60',marginBottom:4}}/>
+            <div style={{textAlign:'center'}}>
+              <div style={{fontSize:9,color:C.faint,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'100%'}}>{b.label}</div>
+              <div style={{fontSize:13,fontWeight:700,color:C.text,fontVariantNumeric:'tabular-nums',lineHeight:1.2}}>{N(b.count)}</div>
+              <div style={{fontSize:9,color:C.muted}}>({pct.toFixed(1)}%)</div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// ─── OVERVIEW ───────────────────────────────────────────────────────────────
+const OverviewPage = ({data}) => {
+  const {useUTC} = useContext(TzCtx);
+  const sev  = data.severityCounts||{};
+  const errs = (sev.E||0)+(sev.F||0), warns=sev.W||0, infos=sev.I||0;
+  const ha   = (data.hourlyActivity||[]).map(h=>({...h,label:fmtMin(h.hour,useUTC)}));
+  const files= data.files||[];
+  const slow = data.slowQueries||[];
+  const maxDur = slow.length>0?slow[0].maxDuration:0;
+
+  const sevData=[
+    {name:'Fatal',   value:sev.F||0,color:'#991b1b'},
+    {name:'Error',   value:sev.E||0,color:C.red},
+    {name:'Warning', value:sev.W||0,color:C.amber},
+    {name:'Info',    value:sev.I||0,color:C.blue},
+  ].filter(d=>d.value>0);
+
+  const comp=data.componentCounts||{};
+  const compData=Object.entries(comp).sort((a,b)=>b[1]-a[1]).slice(0,10)
+    .map(([name,value],i)=>({name,value,fill:PAL[i%PAL.length]}));
+
+  return(
+    <div style={{padding:12,display:'flex',flexDirection:'column',gap:10}}>
+      {/* Stats row */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(150px,1fr))',gap:8}}>
+        <Stat label="Total entries"   value={N(data.totalEntries)} accent={C.blue}/>
+        <Stat label="Errors & fatals" value={N(errs)}  accent={C.red}   sub={`${(errs/Math.max(data.totalEntries,1)*100).toFixed(2)}% of total`}/>
+        <Stat label="Warnings"        value={N(warns)} accent={C.amber} sub={`${(warns/Math.max(data.totalEntries,1)*100).toFixed(2)}% of total`}/>
+        <Stat label="Info"            value={N(infos)} accent={C.faint}/>
+        <Stat label="Slow patterns"   value={N(slow.length)} accent={C.teal} sub="unique query patterns"/>
+        <Stat label="Repl events"     value={N((data.replEvents||[]).length)} accent={C.green}/>
+        <Stat label="Log files"       value={files.length} accent={C.teal}/>
+        {maxDur>0&&<Stat label="Worst slow query" value={ms(maxDur)} accent={C.red} mono/>}
+      </div>
+
+      {/* 4 mini sparks */}
+      {ha.length>0&&(
+        <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+          <MiniSpark title="Errors / min"   data={ha.map(h=>({label:h.label,v:h.errors||0}))} dataKey="v" color={C.red}/>
+          <MiniSpark title="Warnings / min" data={ha.map(h=>({label:h.label,v:h.warns||0}))}  dataKey="v" color={C.amber}/>
+          <MiniSpark title="Slow / min"     data={ha.map(h=>({label:h.label,v:h.slow||0}))}   dataKey="v" color={C.teal}/>
+          <MiniSpark title="Total / min"    data={ha.map(h=>({label:h.label,v:h.total||0}))}  dataKey="v" color={C.blue}/>
+        </div>
+      )}
+
+      {/* Cluster Info panel */}
+      {(()=>{
+        const cl = data.cluster||{};
+        const hasAny = cl.mongoVersion||cl.os?.name||cl.replicaSetName||(cl.members&&cl.members.length>0)||(cl.drivers&&cl.drivers.length>0);
+        if(!hasAny) return null;
+        const ver = cl.mongoVersion||'';
+        const majorVer = parseInt((ver.split('.')[0]||'0'),10);
+        const eolMap = {3:'EOL',4:'EOL',5:'EOL'};
+        const activeMap = {6:'Maintenance',7:'Active',8:'Active'};
+        const verStatus = eolMap[majorVer]||activeMap[majorVer]||null;
+        const verBadgeColor = verStatus==='EOL'?C.red:verStatus==='Maintenance'?C.amber:verStatus==='Active'?C.green:C.faint;
+        const verBadgeBg = verStatus==='EOL'?'#fef2f2':verStatus==='Maintenance'?'#fffbeb':verStatus==='Active'?'#f0fdf4':'#f9fafb';
+        const uniqueDrivers = (cl.drivers||[]).filter((d,i,arr)=>arr.findIndex(x=>x.name===d.name&&x.version===d.version&&x.appName===d.appName)===i);
+        return(
+          <Panel title="Cluster info">
+            <div style={{display:'flex',flexWrap:'wrap',gap:12,alignItems:'flex-start'}}>
+              {ver&&(
+                <div style={{minWidth:130}}>
+                  <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.05em',fontWeight:500,color:C.faint,marginBottom:4}}>MongoDB version</div>
+                  <div style={{display:'flex',alignItems:'center',gap:5}}>
+                    <span style={{fontWeight:600,fontFamily:'ui-monospace,monospace',color:C.text,fontSize:12}}>{ver}</span>
+                    {verStatus&&<span style={{background:verBadgeBg,color:verBadgeColor,border:`1px solid ${verBadgeColor}33`,padding:'1px 5px',borderRadius:3,fontSize:10,fontWeight:600}}>{verStatus}</span>}
+                  </div>
+                </div>
+              )}
+              {cl.os&&(cl.os.name||cl.os.version)&&(
+                <div style={{minWidth:150}}>
+                  <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.05em',fontWeight:500,color:C.faint,marginBottom:4}}>OS</div>
+                  <div style={{fontFamily:'ui-monospace,monospace',color:C.sub,fontSize:11}}>{[cl.os.name,cl.os.version,cl.os.arch].filter(Boolean).join(' ')}</div>
+                </div>
+              )}
+              {cl.replicaSetName&&(
+                <div style={{minWidth:100}}>
+                  <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.05em',fontWeight:500,color:C.faint,marginBottom:4}}>Replica set</div>
+                  <div style={{fontFamily:'ui-monospace,monospace',fontWeight:600,color:C.blue,fontSize:12}}>{cl.replicaSetName}</div>
+                </div>
+              )}
+              {cl.members&&cl.members.length>0&&(
+                <div style={{minWidth:180}}>
+                  <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.05em',fontWeight:500,color:C.faint,marginBottom:4}}>Members ({cl.members.length})</div>
+                  <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                    {cl.members.map((m,i)=>{
+                      const isGreen = (m.priority||0)>0 && !m.hidden && !m.arbiterOnly;
+                      const chipBg = isGreen ? '#f0fdf4' : '#f9fafb';
+                      const chipColor = isGreen ? C.green : C.faint;
+                      const chipBorder = isGreen ? '#bbf7d0' : C.border;
+                      return(
+                        <span key={i} style={{display:'inline-flex',alignItems:'center',gap:4,background:chipBg,color:chipColor,border:`1px solid ${chipBorder}`,padding:'2px 7px',borderRadius:10,fontSize:10,fontFamily:'ui-monospace,monospace'}}>
+                          <span style={{width:5,height:5,borderRadius:'50%',background:chipColor,display:'inline-block'}}/>
+                          {m.host||m.name||`member-${i}`}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              {uniqueDrivers.length>0&&(
+                <div style={{minWidth:180}}>
+                  <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.05em',fontWeight:500,color:C.faint,marginBottom:4}}>Drivers</div>
+                  <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                    {uniqueDrivers.slice(0,6).map((d,i)=>(
+                      <span key={i} style={{background:'#eef1ff',color:C.violet,border:'1px solid #c7d2fe',padding:'2px 7px',borderRadius:10,fontSize:10}}>
+                        {[d.name,d.version,d.appName].filter(Boolean).join(' ')}
+                      </span>
+                    ))}
+                    {uniqueDrivers.length>6&&<span style={{color:C.faint,fontSize:10}}>+{uniqueDrivers.length-6} more</span>}
+                  </div>
+                </div>
+              )}
+            </div>
+          </Panel>
+        );
+      })()}
+
+      {/* Hourly activity chart */}
+      <Panel title="Activity over time" pad={false} sub={`${(data.hourlyActivity||[]).length} buckets`}>
+        <HourlyChart data={data.hourlyActivity} useUTC={useUTC} height={200}/>
+      </Panel>
+
+      {/* Severity + Component */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 2fr',gap:8}}>
+        <Panel title="Severity breakdown">
+          <div style={{display:'flex',flexDirection:'column',gap:6}}>
+            {sevData.map((d,i)=>{
+              const total = sevData.reduce((s,x)=>s+x.value,0)||1;
+              const pct = d.value/total*100;
+              return(
+                <div key={i}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+                    <span style={{fontSize:11,color:C.sub}}>{d.name}</span>
+                    <span style={{fontSize:11,fontWeight:600,color:d.color,fontVariantNumeric:'tabular-nums'}}>{d.value.toLocaleString()}</span>
+                  </div>
+                  <div style={{height:4,background:C.bg,borderRadius:2}}>
+                    <div style={{height:'100%',width:`${pct}%`,background:d.color,borderRadius:2}}/>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+
+        <Panel title="Top components">
+          <div style={{display:'flex',flexDirection:'column',gap:5}}>
+            {compData.map((d,i)=>{
+              const max = compData[0]?.value||1;
+              return(
+                <div key={i} style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:10,color:C.muted,fontFamily:'ui-monospace,monospace',minWidth:72,textAlign:'right'}}>{d.name}</span>
+                  <div style={{flex:1,height:4,background:C.bg,borderRadius:2}}>
+                    <div style={{height:'100%',width:`${d.value/max*100}%`,background:d.fill,borderRadius:2}}/>
+                  </div>
+                  <span style={{fontSize:10,color:C.faint,fontVariantNumeric:'tabular-nums',minWidth:40,textAlign:'right'}}>{d.value.toLocaleString()}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      </div>
+
+      {/* Files table */}
+      <Panel title={`Files summary`} sub={`${files.length} files`} pad={false}>
+        <table>
+          <thead>
+            <tr style={{borderBottom:`1px solid ${C.border}`}}>
+              {['File','Entries','Errors','Warnings','Slow','Error %','Start','End'].map(h=>(
+                <th key={h} style={{padding:'5px 12px',textAlign:'left',fontSize:10,fontWeight:500,color:C.faint,background:C.surface2,whiteSpace:'nowrap'}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {files.map((f,i)=>{
+              const ep=f.entryCount>0?(f.errorCount/f.entryCount*100):0;
+              return(
+                <tr key={i} style={{borderBottom:`1px solid ${C.border2}`}}
+                    onMouseEnter={e=>e.currentTarget.style.background='#f9fafb'}
+                    onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <td style={{padding:'4px 12px',fontFamily:'ui-monospace,monospace',color:C.sub,fontSize:11}}>{f.name}</td>
+                  <td style={{padding:'4px 12px',fontVariantNumeric:'tabular-nums',fontWeight:500}}>{N(f.entryCount)}</td>
+                  <td style={{padding:'4px 12px',fontVariantNumeric:'tabular-nums',color:f.errorCount?C.red:C.faint}}>{N(f.errorCount)}</td>
+                  <td style={{padding:'4px 12px',fontVariantNumeric:'tabular-nums',color:f.warnCount?C.amber:C.faint}}>{N(f.warnCount)}</td>
+                  <td style={{padding:'4px 12px',fontVariantNumeric:'tabular-nums',color:C.teal}}>{N(f.slowCount)}</td>
+                  <td style={{padding:'4px 12px',minWidth:110}}>
+                    <div style={{display:'flex',alignItems:'center',gap:6}}>
+                      <div style={{flex:1,height:3,background:C.border,borderRadius:2}}>
+                        <div style={{height:'100%',borderRadius:2,width:`${Math.min(100,ep*8)}%`,background:ep>5?C.red:ep>1?C.amber:C.green}}/>
+                      </div>
+                      <span style={{color:C.muted,minWidth:38,textAlign:'right',fontSize:11}}>{ep.toFixed(2)}%</span>
+                    </div>
+                  </td>
+                  <td style={{padding:'4px 12px',color:C.faint,fontSize:11,whiteSpace:'nowrap'}}>{fmtDate(f.timeRange?.start,useUTC)}</td>
+                  <td style={{padding:'4px 12px',color:C.faint,fontSize:11,whiteSpace:'nowrap'}}>{fmtDate(f.timeRange?.end,useUTC)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Panel>
+    </div>
+  );
+};
+
+// ─── SLOW QUERIES ───────────────────────────────────────────────────────────
+const SlowQueriesPage = ({data, onModal}) => {
+  const {useUTC} = useContext(TzCtx);
+  const [sortCol, setSortCol] = useState('maxDuration');
+  const [sortDir, setSortDir] = useState(-1);
+  const [filter,  setFilter]  = useState('');
+  const [collscanOnly, setCollscanOnly] = useState(false);
+
+  const ts   = (data.slowTimeSeries||[]).map(p=>({
+    ts:new Date(p.minute+':00Z').getTime(),
+    duration:Math.round(p.avgDuration),docs:p.avgDocs||0,keys:p.avgKeys||0,
+    returned:Math.round(p.avgReturned||0),count:p.count,minute:p.minute,
+  }));
+  const dd   = data.durationDistribution||[];
+  const pc   = data.slowPlanCounts||[];
+  const ct   = data.slowCommandTypes||[];
+  const fc   = (data.files||[]).map(f=>({
+    name:trunc(f.name,18),
+    errorPct:f.entryCount>0?(f.errorCount/f.entryCount*100):0,
+    warnPct: f.entryCount>0?(f.warnCount/f.entryCount*100):0,
+    slowPct: f.entryCount>0?(f.slowCount/f.entryCount*100):0,
+  }));
+  const planColors={COLLSCAN:C.red,IXSCAN:C.green,IDHACK:C.blue,FETCH:C.sky,COUNT:C.teal,UNKNOWN:C.faint};
+
+  // DBA insight: COLLSCAN count
+  const collscanCount=(data.slowQueries||[]).filter(q=>(q.planSummary||'').toUpperCase().startsWith('COLLSCAN')).length;
+  const noIndexCount =(data.slowQueries||[]).filter(q=>q.inefficiency>1000).length;
+
+  const durSpark  = ts.map(p=>({label:fmtMin(p.minute,useUTC),v:p.duration}));
+  const docsSpark = ts.map(p=>({label:fmtMin(p.minute,useUTC),v:Math.round(p.docs)}));
+  const keysSpark = ts.map(p=>({label:fmtMin(p.minute,useUTC),v:Math.round(p.keys)}));
+  const retSpark  = ts.map(p=>({label:fmtMin(p.minute,useUTC),v:p.returned}));
+
+  const colMap={namespace:'namespace',planSummary:'planSummary',commandType:'commandType',maxDuration:'maxDuration',minDuration:'minDuration',avgDuration:'avgDuration',count:'count',inefficiency:'inefficiency',avgDocsExamined:'avgDocsExamined',avgKeysExamined:'avgKeysExamined',avgNReturned:'avgNReturned',totalDuration:'totalDuration',avgResLen:'avgResLen',avgNumYields:'avgNumYields',avgRemoteWaitMs:'avgRemoteWaitMs'};
+  const rows = useMemo(()=>{
+    const q=filter.toLowerCase();
+    const filtered=(data.slowQueries||[]).filter(r=>{
+      if(collscanOnly && !(r.planSummary||'').toUpperCase().startsWith('COLLSCAN')) return false;
+      return !q||(r.namespace||'').toLowerCase().includes(q)||(r.queryHash||'').toLowerCase().includes(q)||(r.planSummary||'').toLowerCase().includes(q)||(r.commandType||'').toLowerCase().includes(q);
+    });
+    return [...filtered].sort((a,b)=>{
+      let av=a[colMap[sortCol]]??0, bv=b[colMap[sortCol]]??0;
+      if(typeof av==='string')av=av.toLowerCase();
+      if(typeof bv==='string')bv=bv.toLowerCase();
+      return sortDir*(av>bv?1:av<bv?-1:0);
+    });
+  },[data.slowQueries,sortCol,sortDir,filter,collscanOnly]);
+
+  const sort=col=>{if(sortCol===col)setSortDir(d=>-d);else{setSortCol(col);setSortDir(-1);}};
+  const Th=({col,label,align='left'})=>(
+    <th onClick={()=>sort(col)} style={{
+      padding:'5px 10px',textAlign:align,fontSize:10,fontWeight:500,color:sortCol===col?C.sub:C.faint,
+      background:C.surface2,cursor:'pointer',whiteSpace:'nowrap',userSelect:'none',
+    }}>
+      {label}{sortCol===col&&<span style={{color:C.blue,marginLeft:2}}>{sortDir===-1?'↓':'↑'}</span>}
+    </th>
+  );
+  const TH=({label,align='left'})=>(
+    <th style={{padding:'5px 10px',textAlign:align,fontSize:10,fontWeight:500,color:C.faint,background:C.surface2,whiteSpace:'nowrap'}}>{label}</th>
+  );
+
+  return(
+    <div style={{padding:12,display:'flex',flexDirection:'column',gap:10}}>
+      {/* DBA alerts */}
+      {(collscanCount>0||noIndexCount>0)&&(
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          {collscanCount>0&&(
+            <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 14px',borderRadius:8,background:'#fef2f2',border:'1px solid #fecaca50'}}>
+              <span style={{fontSize:14,lineHeight:1}}>⚠</span>
+              <span style={{fontSize:12,fontWeight:600,color:C.red}}>{collscanCount} collection scan{collscanCount>1?'s':''} detected</span>
+              <span style={{fontSize:11,color:C.muted}}>— queries without index usage</span>
+            </div>
+          )}
+          {noIndexCount>0&&(
+            <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 14px',borderRadius:8,background:'#fefce8',border:'1px solid #fde68a50'}}>
+              <span style={{fontSize:14,lineHeight:1}}>⚠</span>
+              <span style={{fontSize:12,fontWeight:600,color:C.amber}}>{noIndexCount} pattern{noIndexCount>1?'s':''} likely missing an index</span>
+              <span style={{fontSize:11,color:C.muted}}>— inefficiency &gt; 1000</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 4 sparks */}
+      {ts.length>0&&(
+        <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+          <MiniSpark title="Avg duration"      data={durSpark}  dataKey="v" color={C.blue}  unit="ms"/>
+          <MiniSpark title="Avg docs examined" data={docsSpark} dataKey="v" color={C.amber}/>
+          <MiniSpark title="Avg keys examined" data={keysSpark} dataKey="v" color={C.green}/>
+          <MiniSpark title="Avg returned"      data={retSpark}  dataKey="v" color={C.teal}/>
+        </div>
+      )}
+
+      {/* Duration distribution */}
+      <Panel title="Duration distribution" sub={`${dd.reduce((s,d)=>s+d.count,0)} slow queries total`} pad={false}>
+        <DurationDist data={dd}/>
+      </Panel>
+
+      {/* Slow queries over time */}
+      <Panel title="Activity over time" pad={false} sub="per-minute avg duration + query count">
+        {ts.length>0?(
+          (()=>{
+            const labels  = ts.map(p=>fmtMin(p.minute,useUTC));
+            const durData = ts.map(p=>p.duration);
+            const cntData = ts.map(p=>p.count);
+            const durFmt  = v => v>=60000?Math.round(v/60000)+'m':v>=1000?(v/1000).toFixed(1)+'s':Math.round(v)+'ms';
+            const opt = {
+              animation:false,
+              grid:{top:8,right:48,bottom:22,left:52},
+              xAxis:{type:'category',data:labels,axisLine:{show:false},axisTick:{show:false},axisLabel:{fontSize:9,color:C.faint,interval:'auto'}},
+              yAxis:[
+                {type:'value',axisLine:{show:false},axisTick:{show:false},
+                  splitLine:{lineStyle:{color:GRID,type:'dashed'}},axisLabel:{fontSize:9,color:C.faint,formatter:durFmt}},
+                {type:'value',axisLine:{show:false},axisTick:{show:false},splitLine:{show:false},axisLabel:{fontSize:9,color:C.faint}},
+              ],
+              ...ZOOM_CFG,
+              tooltip:{
+                trigger:'axis',confine:true,
+                axisPointer:{type:'line',lineStyle:{color:'rgba(150,150,150,0.25)',type:'dashed',width:1}},
+                backgroundColor:'#1c2027',borderWidth:0,padding:[6,10],
+                textStyle:{color:'#f3f4f6',fontSize:11},
+                formatter:params=>{
+                  const dur=params.find(p=>p.seriesName==='Avg duration');
+                  const cnt=params.find(p=>p.seriesName==='Count');
+                  const v=dur?.value??0;
+                  return `<div style="color:#9ca3af;font-size:10px;margin-bottom:2px">${params[0]?.name}</div><div style="display:flex;align-items:center;gap:6px;margin-top:3px"><span style="width:7px;height:7px;border-radius:50%;background:${C.blue};display:inline-block"></span><span style="color:#9ca3af">Avg duration:</span><b style="color:${C.blue};margin-left:4px">${durFmt(v)}</b></div><div style="display:flex;align-items:center;gap:6px;margin-top:3px"><span style="width:7px;height:7px;border-radius:50%;background:${C.teal};display:inline-block"></span><span style="color:#9ca3af">Count:</span><b style="color:${C.teal};margin-left:4px">${cnt?.value??0}</b></div>`;
+                },
+              },
+              series:[
+                {name:'Avg duration',type:'line',yAxisIndex:0,data:durData,smooth:false,symbol:'none',
+                  lineStyle:{color:C.blue,width:1.5},areaStyle:{color:C.blue+'18'}},
+                {name:'Count',type:'bar',yAxisIndex:1,data:cntData,barMaxWidth:3,
+                  itemStyle:{color:C.teal+'80',borderRadius:1}},
+              ],
+            };
+            return (
+              <div style={{padding:'12px 16px 4px'}}>
+                <EChart option={opt} height={200}/>
+                <div style={{display:'flex',gap:14,paddingTop:6,paddingLeft:4}}>
+                  {[{name:'Avg duration',color:C.blue},{name:'Count',color:C.teal}].map(s=>(
+                    <span key={s.name} style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:10,color:C.muted}}>
+                      <span style={{width:18,height:2,background:s.color,display:'inline-block',borderRadius:1}}/>
+                      {s.name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })()
+        ):(
+          <div style={{height:160,display:'flex',alignItems:'center',justifyContent:'center',color:C.faint}}>No time-series data</div>
+        )}
+      </Panel>
+
+      {/* Plan + Cmd */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+        <Panel title="Plan summary">
+          <div style={{display:'flex',flexDirection:'column',gap:5}}>
+            {pc.map((d,i)=>{
+              const max=pc[0]?.value||1;
+              const color=planColors[d.key]||C.faint;
+              return(
+                <div key={i} style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:10,fontFamily:'ui-monospace,monospace',color,minWidth:64}}>{d.key}</span>
+                  <div style={{flex:1,height:4,background:C.bg,borderRadius:2}}>
+                    <div style={{height:'100%',width:`${d.value/max*100}%`,background:color,borderRadius:2}}/>
+                  </div>
+                  <span style={{fontSize:10,color:C.faint,minWidth:36,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{d.value}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+        <Panel title="Command types">
+          <div style={{display:'flex',flexDirection:'column',gap:5}}>
+            {ct.map((d,i)=>{
+              const max=ct[0]?.value||1;
+              const color=PAL[i%PAL.length];
+              return(
+                <div key={i} style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:10,fontFamily:'ui-monospace,monospace',color:C.sub,minWidth:64}}>{d.key}</span>
+                  <div style={{flex:1,height:4,background:C.bg,borderRadius:2}}>
+                    <div style={{height:'100%',width:`${d.value/max*100}%`,background:color,borderRadius:2}}/>
+                  </div>
+                  <span style={{fontSize:10,color:C.faint,minWidth:36,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{d.value}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      </div>
+
+      {/* Query table */}
+      <Panel title="Query patterns" sub={`${rows.length} patterns`} pad={false}
+        action={
+          <div style={{display:'flex',alignItems:'center',gap:6}}>
+            <button
+              onClick={()=>setCollscanOnly(v=>!v)}
+              style={{
+                padding:'3px 10px',borderRadius:4,fontSize:11,fontWeight:500,
+                background: collscanOnly ? '#fef2f2' : '#f9fafb',
+                color: collscanOnly ? C.red : C.muted,
+                border:`1px solid ${collscanOnly ? '#fecaca' : C.border}`,
+                cursor:'pointer',whiteSpace:'nowrap',
+              }}
+            >COLLSCAN only</button>
+            <div style={{position:'relative'}}>
+              <span style={{position:'absolute',left:8,top:'50%',transform:'translateY(-50%)',color:C.faint,fontSize:12}}>⌕</span>
+              <input value={filter} onChange={e=>setFilter(e.target.value)}
+                style={{paddingLeft:22,paddingRight:8,paddingTop:4,paddingBottom:4,fontSize:11,
+                        background:C.surface,border:`1px solid ${C.border}`,borderRadius:4,color:C.text,
+                        outline:'none',width:185}}
+                placeholder="Filter namespace / hash…"/>
+            </div>
+          </div>
+        }>
+        <div style={{overflowX:'auto',maxHeight:520,overflowY:'auto'}}>
+          <table style={{fontSize:11,whiteSpace:'nowrap'}}>
+            <thead style={{position:'sticky',top:0,zIndex:10}}>
+              <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                <TH label="Namespace"/>
+                <TH label="Hash"/>
+                <TH label="Plan"/>
+                <Th col="commandType"     label="Cmd"/>
+                <Th col="count"           label="Exec" align="right"/>
+                <Th col="maxDuration"     label="Max time" align="right"/>
+                <Th col="avgDuration"     label="Avg time" align="right"/>
+                <Th col="minDuration"     label="Min time" align="right"/>
+                <Th col="totalDuration"   label="Total time" align="right"/>
+                <Th col="avgDocsExamined" label="Avg docs" align="right"/>
+                <Th col="avgKeysExamined" label="Avg keys" align="right"/>
+                <Th col="avgNReturned"    label="Avg ret." align="right"/>
+                <Th col="avgResLen"       label="Avg reslen" align="right"/>
+                <Th col="avgNumYields"    label="Avg yields" align="right"/>
+                <Th col="avgRemoteWaitMs" label="Remote wait" align="right"/>
+                <TH label=""/>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((q,i)=>{
+                const isCS=(q.planSummary||'').toUpperCase().startsWith('COLLSCAN');
+                const maxCount=rows[0]?.count||1;
+                return(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.border2}`,background:isCS?'#fff5f5':undefined}}
+                      onMouseEnter={e=>e.currentTarget.style.background=isCS?'#fee2e2':'#f9fafb'}
+                      onMouseLeave={e=>e.currentTarget.style.background=isCS?'#fff5f5':'transparent'}>
+                    <td style={{padding:'4px 10px',fontFamily:'ui-monospace,monospace',color:C.sub,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis'}} title={q.namespace}>{q.namespace||'—'}</td>
+                    <td style={{padding:'4px 10px',fontFamily:'ui-monospace,monospace',color:C.faint,maxWidth:72,overflow:'hidden',textOverflow:'ellipsis',fontSize:10}} title={q.queryHash}>{q.queryHash||'—'}</td>
+                    <td style={{padding:'4px 10px',maxWidth:130,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}><PlanBadge plan={q.planSummary} copyable={true}/></td>
+                    <td style={{padding:'4px 10px',color:C.muted}}>{q.commandType||'—'}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right'}}>
+                      <div style={{display:'flex',alignItems:'center',gap:5,justifyContent:'flex-end'}}>
+                        <div style={{width:36,height:3,background:C.border,borderRadius:2}}>
+                          <div style={{height:'100%',width:`${Math.min(100,q.count/maxCount*100)}%`,background:C.blue,borderRadius:2}}/>
+                        </div>
+                        <span style={{color:C.blue,fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{N(q.count)}</span>
+                      </div>
+                    </td>
+                    <td style={{padding:'4px 10px',textAlign:'right',fontWeight:600,color:C.red,fontVariantNumeric:'tabular-nums'}}>{ms(q.maxDuration)}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:C.sub,fontVariantNumeric:'tabular-nums'}}>{ms(Math.round(q.avgDuration))}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:C.green,fontVariantNumeric:'tabular-nums'}}>{ms(q.minDuration)}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:C.muted,fontVariantNumeric:'tabular-nums'}}>{ms(q.totalDuration)}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:C.amber,fontVariantNumeric:'tabular-nums'}}>{N(Math.round(q.avgDocsExamined))}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:C.lime,fontVariantNumeric:'tabular-nums'}}>{N(Math.round(q.avgKeysExamined))}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:C.teal,fontVariantNumeric:'tabular-nums'}}>{N(Math.round(q.avgNReturned))}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:q.avgResLen>102400?C.red:C.muted,fontVariantNumeric:'tabular-nums'}}>{bytes(q.avgResLen)}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',color:q.avgNumYields>10?C.amber:C.muted,fontVariantNumeric:'tabular-nums'}}>{F1(q.avgNumYields)}</td>
+                    <td style={{padding:'4px 10px',textAlign:'right',fontVariantNumeric:'tabular-nums',color:q.avgRemoteWaitMs>0?(q.remoteWaitPct>=50?C.orange:q.remoteWaitPct>=25?C.amber:C.muted):C.muted}}>{q.avgRemoteWaitMs>0?ms(Math.round(q.avgRemoteWaitMs)):'—'}</td>
+                    <td style={{padding:'4px 10px'}}>
+                      <button onClick={()=>onModal(q)} style={{
+                        background:`${C.blue}0f`,color:C.blue,border:`1px solid ${C.blue}30`,
+                        padding:'2px 9px',borderRadius:6,fontSize:10,fontWeight:500,cursor:'pointer',
+                      }}
+                      onMouseOver={e=>e.currentTarget.style.background=`${C.blue}18`}
+                      onMouseOut={e=>e.currentTarget.style.background=`${C.blue}0f`}>
+                        View
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+              {!rows.length&&<tr><td colSpan={15} style={{padding:36,textAlign:'center',color:C.faint}}>No slow queries found</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  );
+};
+
+// ─── Error suggestion map ────────────────────────────────────────────────────
+const ERROR_SUGGESTIONS = [
+  {match:/not master|not primary/i,            hint:"Node stepped down. Check rs.status() for current primary"},
+  {match:/Unauthorized/i,                       hint:"Verify credentials and user roles with db.getUsers()"},
+  {match:/connection refused/i,                 hint:"Check mongod is running and port is accessible"},
+  {match:/WriteConflict/i,                      hint:"Retry write operation or reduce transaction contention"},
+  {match:/exceeded memory limit/i,              hint:"Add allowDiskUse:true or add index to avoid in-memory sort"},
+  {match:/cursor id/i,                          hint:"Cursor timed out. Process results faster or increase cursorTimeoutMillis"},
+  {match:/DuplicateKey|E11000/i,               hint:"Unique index violation. Review application logic for duplicate inserts"},
+  {match:/too many open files/i,               hint:"Increase OS file descriptor limit: ulimit -n 65536"},
+  {match:/interrupted at shutdown/i,           hint:"Normal during planned shutdown. Investigate if unexpected"},
+  {match:/network timeout|SocketException/i,   hint:"Check network latency and firewall rules between nodes"},
+  {match:/COLLSCAN/i,                          hint:"Add an index. Use explain() to find the optimal index"},
+  {match:/out of memory/i,                     hint:"Increase RAM or optimize queries to reduce working set size"},
+  {match:/Overflow sort stage/i,               hint:"Add a compound index matching the sort fields"},
+  {match:/oplog/i,                             hint:"Check oplog size. Secondaries may be falling behind"},
+  {match:/replication lag/i,                   hint:"Check network between primary and secondaries, reduce write load"},
+];
+function getErrSuggestion(msg) {
+  if(!msg) return null;
+  for(const s of ERROR_SUGGESTIONS) { if(s.match.test(msg)) return s.hint; }
+  return null;
+}
+
+// ─── ERRORS ─────────────────────────────────────────────────────────────────
+const ErrorMsgModal = ({g, onClose}) => {
+  const {useUTC} = useContext(TzCtx);
+  const [prettyJson, setPrettyJson] = useState(false);
+  useEffect(()=>{
+    const h=e=>{if(e.key==='Escape')onClose();};
+    window.addEventListener('keydown',h);
+    return()=>window.removeEventListener('keydown',h);
+  },[]);
+  if(!g) return null;
+
+  // pretty-print the raw line if available
+  let prettyLine = g.lastRawLine || '';
+  if(prettyJson && prettyLine){
+    try{ prettyLine = JSON.stringify(JSON.parse(prettyLine), null, 2); }catch(_){}
+  }
+
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:50,display:'flex',alignItems:'center',justifyContent:'center',padding:24,background:'rgba(0,0,0,.35)'}}
+         onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{width:'100%',maxWidth:760,maxHeight:'90vh',display:'flex',flexDirection:'column',background:C.surface,borderRadius:8,boxShadow:'0 8px 32px rgba(0,0,0,.18)',border:`1px solid ${C.border}`,overflow:'hidden'}}>
+        {/* Header */}
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'12px 16px',borderBottom:`1px solid ${C.border}`,background:C.surface2,flexShrink:0}}>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <SevBadge s={g.severity}/>
+            {g.errCode>0&&<span style={{fontFamily:'ui-monospace,monospace',fontSize:11,color:C.red,fontWeight:600}}>Code {g.errCode}</span>}
+            <span style={{fontSize:11,color:C.muted}}>× {N(g.count)}</span>
+            {g.component&&<span style={{fontFamily:'ui-monospace,monospace',fontSize:10,color:C.faint}}>{g.component}</span>}
+          </div>
+          <button onClick={onClose} style={{fontSize:18,color:C.faint,background:'none',border:'none',cursor:'pointer',padding:'2px 6px',borderRadius:6}}
+            onMouseOver={e=>e.currentTarget.style.background=C.bg} onMouseOut={e=>e.currentTarget.style.background='none'}>×</button>
+        </div>
+        {/* Body */}
+        <div style={{padding:16,display:'flex',flexDirection:'column',gap:12,overflowY:'auto'}}>
+          <div>
+            <div style={{fontSize:9,fontWeight:600,color:C.faint,textTransform:'uppercase',letterSpacing:'.05em',marginBottom:6}}>Full error message</div>
+            <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:'12px 14px',fontSize:12,color:C.text,lineHeight:1.7,wordBreak:'break-word',fontFamily:'ui-monospace,monospace',whiteSpace:'pre-wrap'}}>
+              {g.errMsg||'—'}
+            </div>
+          </div>
+          {(g.namespaces||[]).length>0&&(
+            <div>
+              <div style={{fontSize:9,fontWeight:600,color:C.faint,textTransform:'uppercase',letterSpacing:'.05em',marginBottom:6}}>Affected namespaces</div>
+              <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+                {g.namespaces.map((ns,i)=>(
+                  <span key={i} style={{fontFamily:'ui-monospace,monospace',fontSize:10,background:`${C.blue}0d`,color:C.blue,border:`1px solid ${C.blue}25`,padding:'2px 8px',borderRadius:5}}>{ns}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {(()=>{const s=getErrSuggestion(g.errMsg);return s&&(
+            <div style={{background:'#fefce8',border:'1px solid #fde68a60',borderRadius:8,padding:'10px 14px'}}>
+              <div style={{fontSize:9,fontWeight:600,color:C.amber,textTransform:'uppercase',letterSpacing:'.05em',marginBottom:4}}>Suggestion</div>
+              <div style={{fontSize:11,color:'#92400e',lineHeight:1.6}}>{s}</div>
+            </div>
+          );})()}
+          {prettyLine&&(
+            <div>
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <div style={{fontSize:9,fontWeight:600,color:C.faint,textTransform:'uppercase',letterSpacing:'.05em'}}>Last occurrence — raw log line</div>
+                  {g.lastTimestamp&&(
+                    <span style={{fontSize:10,color:C.muted,fontFamily:'ui-monospace,monospace'}}>
+                      {fmtDate(g.lastTimestamp, useUTC)}
+                    </span>
+                  )}
+                  <span style={{fontSize:10,background:'#fef3c7',color:'#92400e',border:'1px solid #fde68a60',borderRadius:4,padding:'1px 7px',fontWeight:600}}>
+                    most recent in this group
+                  </span>
+                </div>
+                <button onClick={()=>setPrettyJson(p=>!p)} style={{fontSize:10,padding:'2px 8px',borderRadius:5,border:`1px solid ${C.border}`,background:prettyJson?C.blue:'none',color:prettyJson?'#fff':C.muted,cursor:'pointer',fontFamily:'ui-monospace,monospace'}}>
+                  {prettyJson?'compact':'pretty'}
+                </button>
+              </div>
+              <pre style={{margin:0,background:'#1c2027',color:'#e5e7eb',borderRadius:6,padding:'12px 14px',fontSize:10,lineHeight:1.6,overflowX:'auto',whiteSpace:'pre-wrap',wordBreak:'break-all',maxHeight:320,overflowY:'auto'}}>
+                {prettyLine}
+              </pre>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ErrorsPage = ({data}) => {
+  const {useUTC} = useContext(TzCtx);
+  const [filter,   setFilter]   = useState('');
+  const [errModal, setErrModal] = useState(null);
+  const groups = data.errorGroups||[];
+  const msgs   = data.messageGroups||[];
+  const sev    = data.severityCounts||{};
+
+  // top error messages by count for chart
+  const top15 = groups.slice(0,15).map((g,i)=>({...g,fill:PAL[i%PAL.length]}));
+
+  const rows = useMemo(()=>{
+    const q = filter.toLowerCase();
+    return groups.filter(g=>!q||(g.errMsg||'').toLowerCase().includes(q)||String(g.errCode).includes(q));
+  },[groups,filter]);
+
+  // Error rate over time from hourlyActivity
+  const ha = (data.hourlyActivity||[]).map(h=>({label:fmtMin(h.hour,useUTC),v:h.errors}));
+
+  return(
+    <div style={{padding:12,display:'flex',flexDirection:'column',gap:10}}>
+      {/* Stats */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:8}}>
+        <Stat label="Fatal"   value={N(sev.F||0)} accent='#991b1b'/>
+        <Stat label="Error"   value={N(sev.E||0)} accent={C.red}    sub={`${((sev.E||0)/Math.max(data.totalEntries,1)*100).toFixed(2)}% of total`}/>
+        <Stat label="Warning" value={N(sev.W||0)} accent={C.amber}  sub={`${((sev.W||0)/Math.max(data.totalEntries,1)*100).toFixed(2)}% of total`}/>
+        <Stat label="Unique error messages" value={N(groups.length)} accent={C.orange}/>
+        <Stat label="With error code" value={N(groups.filter(g=>g.errCode>0).length)} accent={C.sky}/>
+      </div>
+
+      {/* Error rate sparkline */}
+      {ha.length>0&&(
+        <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+          <MiniSpark title="Errors / min" data={ha.map(h=>({label:h.label,v:h.v||0}))} dataKey="v" color={C.red}/>
+          <MiniSpark title="Warnings / min" data={(data.hourlyActivity||[]).map(h=>({label:fmtMin(h.hour,useUTC),v:h.warns||0}))} dataKey="v" color={C.amber}/>
+        </div>
+      )}
+
+      {/* Top errors bar chart */}
+      {top15.length>0&&(
+        <Panel title="Top errors by frequency">
+          <div style={{display:'flex',flexDirection:'column',gap:6}}>
+            {top15.map((d,i)=>{
+              const max=top15[0]?.count||1;
+              return(
+                <div key={i}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:2}}>
+                    <span style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1,paddingRight:10}}
+                      title={d.errMsg}>{d.errMsg?.length>70?d.errMsg.slice(0,70)+'…':d.errMsg}</span>
+                    <span style={{fontSize:11,fontWeight:600,color:d.fill,fontVariantNumeric:'tabular-nums',flexShrink:0}}>{d.count.toLocaleString()}</span>
+                  </div>
+                  <div style={{height:3,background:C.bg,borderRadius:2}}>
+                    <div style={{height:'100%',width:`${d.count/max*100}%`,background:d.fill,borderRadius:2}}/>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      )}
+
+      {/* Error groups table */}
+      <Panel title="Error groups" sub={`${rows.length} unique messages`} pad={false}
+        action={
+          <div style={{position:'relative'}}>
+            <span style={{position:'absolute',left:8,top:'50%',transform:'translateY(-50%)',color:C.faint,fontSize:12}}>⌕</span>
+            <input value={filter} onChange={e=>setFilter(e.target.value)}
+              style={{paddingLeft:22,paddingRight:8,paddingTop:4,paddingBottom:4,fontSize:11,
+                      background:C.surface,border:`1px solid ${C.border}`,borderRadius:4,color:C.text,outline:'none',width:200}}
+              placeholder="Filter message / code…"/>
+          </div>
+        }>
+        <div style={{overflowX:'auto',maxHeight:500,overflowY:'auto'}}>
+          <table style={{fontSize:11}}>
+            <thead style={{position:'sticky',top:0,zIndex:10}}>
+              <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                {['#','Error message','Code','Count','Severity','Component','Namespaces','Suggestion',''].map(h=>(
+                  <th key={h} style={{padding:'5px 12px',textAlign:'left',fontSize:10,fontWeight:500,color:C.faint,background:C.surface2,whiteSpace:'nowrap'}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((g,i)=>{
+                const suggestion = getErrSuggestion(g.errMsg);
+                return(
+                <tr key={i} style={{borderBottom:`1px solid ${C.border2}`}}
+                    onMouseEnter={e=>e.currentTarget.style.background='#f9fafb'}
+                    onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <td style={{padding:'4px 12px',color:C.faint,fontVariantNumeric:'tabular-nums'}}>{i+1}</td>
+                  <td style={{padding:'4px 12px',color:C.text,maxWidth:360,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={g.errMsg}>{g.errMsg||'—'}</td>
+                  <td style={{padding:'4px 12px',fontFamily:'ui-monospace,monospace',color:g.errCode>0?C.red:C.faint,fontWeight:g.errCode>0?600:400}}>{g.errCode>0?g.errCode:'—'}</td>
+                  <td style={{padding:'4px 12px',fontWeight:600,color:C.red,fontVariantNumeric:'tabular-nums'}}>{N(g.count)}</td>
+                  <td style={{padding:'4px 12px'}}><SevBadge s={g.severity}/></td>
+                  <td style={{padding:'4px 12px',fontFamily:'ui-monospace,monospace',color:C.muted,fontSize:10}}>{g.component||'—'}</td>
+                  <td style={{padding:'4px 12px',color:C.faint,fontSize:11}}>
+                    {(g.namespaces||[]).slice(0,3).map((ns,j)=>(
+                      <span key={j} style={{marginRight:4,fontFamily:'ui-monospace,monospace',fontSize:10}}>{ns}</span>
+                    ))}
+                    {(g.namespaces||[]).length>3&&<span style={{color:C.faint}}>+{g.namespaces.length-3}</span>}
+                  </td>
+                  <td style={{padding:'4px 12px',maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={suggestion||undefined}>
+                    {suggestion
+                      ? <em style={{color:C.muted,fontSize:10,fontStyle:'italic'}}>{suggestion.length>60?suggestion.slice(0,60)+'…':suggestion}</em>
+                      : <span style={{color:C.faint,fontSize:10}}>—</span>
+                    }
+                  </td>
+                  <td style={{padding:'4px 10px'}}>
+                    <button onClick={()=>setErrModal(g)} style={{
+                      background:`${C.blue}0f`,color:C.blue,border:`1px solid ${C.blue}30`,
+                      padding:'2px 9px',borderRadius:6,fontSize:10,fontWeight:500,cursor:'pointer',whiteSpace:'nowrap',
+                    }}
+                    onMouseOver={e=>e.currentTarget.style.background=`${C.blue}18`}
+                    onMouseOut={e=>e.currentTarget.style.background=`${C.blue}0f`}>
+                      View
+                    </button>
+                  </td>
+                </tr>
+                );
+              })}
+              {!rows.length&&<tr><td colSpan={9} style={{padding:36,textAlign:'center',color:C.faint}}>No error groups found</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+      {errModal&&<ErrorMsgModal g={errModal} onClose={()=>setErrModal(null)}/>}
+    </div>
+  );
+};
+
+// ─── REPLICATION ────────────────────────────────────────────────────────────
+const REPL_DOT = {
+  election_won:C.green, election_start:C.blue, election:C.blue,
+  stepdown:C.red, primary_change:C.green, secondary_change:C.teal,
+  heartbeat_error:C.red, heartbeat:C.faint, config_change:C.violet,
+  initial_sync:C.amber, rollback:'#be123c', repl_other:C.faint,
+};
+const REPL_LABEL = {
+  election_won:'Election Won', election_start:'Election Start', election:'Election',
+  stepdown:'Step Down', primary_change:'Primary Change', secondary_change:'Secondary Change',
+  heartbeat_error:'Heartbeat Error', heartbeat:'Heartbeat', config_change:'Config Change',
+  initial_sync:'Initial Sync', rollback:'Rollback', repl_other:'Other',
+};
+const ROLE_STYLE = {
+  primary:   {bg:'#f0fdf6', border:'#22c55e50', ring:'#22c55e', text:'#15803d', dot:C.green},
+  secondary: {bg:'#f0f5ff', border:'#93b8fd50', ring:'#3b82f6', text:'#1d4ed8', dot:C.blue},
+  hidden:    {bg:'#f7f8fb', border:'#cdd4de',   ring:'#8a96a8', text:'#5c6b80', dot:C.faint},
+  arbiter:   {bg:'#eef2ff', border:'#93a8fb50', ring:'#5b7af8', text:'#3451c7', dot:C.violet},
+  passive:   {bg:'#fefce8', border:'#fcd34d50', ring:'#d97706', text:'#92400e', dot:C.amber},
+};
+const ROLE_DESC = {
+  hidden:  'Hidden members are invisible to clients and cannot become primary. Typically used for dedicated backup or reporting nodes.',
+  arbiter: 'Arbiters vote in elections but hold no data and cannot become primary. They add an odd vote to prevent ties.',
+  passive: 'Priority 0: replicates data normally but will never be elected as primary.',
+};
+
+function getRole(m, lastPrimary) {
+  if (!m) return 'secondary';
+  if (lastPrimary && m.host === lastPrimary) return 'primary';
+  // Use live state from heartbeat tracking if available
+  if (m.state === 'PRIMARY') return 'primary';
+  if (m.arbiter || m.state === 'ARBITER') return 'arbiter';
+  if (m.hidden)  return 'hidden';
+  if ((m.priority||1) === 0) return 'passive';
+  return 'secondary';
+}
+
+const TopoCard = ({m, lastPrimary}) => {
+  const role = getRole(m, lastPrimary);
+  const rs   = ROLE_STYLE[role] || ROLE_STYLE.secondary;
+  const isPrimary = role === 'primary';
+  return (
+    <div style={{
+      borderRadius:6,
+      background:C.surface,
+      border:`1px solid ${C.border}`,
+      borderTop:`2px solid ${rs.ring}`,
+      padding:'12px 14px',
+      minWidth:180, maxWidth:280,
+      flex:'1 1 180px',
+      position:'relative',
+    }}>
+      {/* Role badge */}
+      <div style={{
+        position:'absolute',top:12,right:12,
+        fontSize:9,fontWeight:700,textTransform:'uppercase',letterSpacing:'.08em',
+        padding:'2px 8px',borderRadius:20,
+        background: isPrimary ? rs.ring : `${rs.ring}18`,
+        color: isPrimary ? '#fff' : rs.text,
+      }}>
+        {isPrimary ? '★ Primary' : role}
+      </div>
+      {/* Status row */}
+      <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:8}}>
+        <span style={{
+          width:8,height:8,borderRadius:'50%',background:rs.ring,display:'inline-block',flexShrink:0,
+          boxShadow: isPrimary ? `0 0 0 3px ${rs.ring}28` : undefined,
+        }}/>
+        <span style={{fontSize:10,color:rs.text,fontWeight:600,textTransform:'uppercase',letterSpacing:'.05em'}}>
+          {isPrimary ? 'Active Primary' : role.charAt(0).toUpperCase()+role.slice(1)}
+        </span>
+      </div>
+      {/* Host */}
+      <div style={{
+        fontFamily:'ui-monospace,monospace',fontSize:11,fontWeight:700,
+        color:C.text,paddingRight:72,wordBreak:'break-all',lineHeight:1.5,marginBottom:10,
+      }}>
+        {m.host}
+      </div>
+      {/* Divider */}
+      <div style={{height:1,background:`${rs.ring}18`,marginBottom:8}}/>
+      {/* Meta chips */}
+      <div style={{display:'flex',gap:6,flexWrap:'wrap',fontSize:10,color:C.faint}}>
+        {m.id != null && <span>ID {m.id}</span>}
+        {(m.priority||0) > 0 && <span>Priority {m.priority}</span>}
+        {m.hidden  && <span style={{background:C.bg,color:C.muted,padding:'1px 5px',borderRadius:4,border:`1px solid ${C.border}`}}>hidden</span>}
+        {m.arbiter && <span style={{background:`${rs.ring}12`,color:rs.text,padding:'1px 5px',borderRadius:4,border:`1px solid ${rs.ring}30`}}>arbiter</span>}
+        {m.state && <span style={{background:`${rs.ring}12`,color:rs.text,padding:'1px 5px',borderRadius:4,border:`1px solid ${rs.ring}30`,fontWeight:600}}>{m.state}</span>}
+      </div>
+      {/* Role description */}
+      {ROLE_DESC[role] && (
+        <div style={{fontSize:10,color:rs.text,background:`${rs.ring}0e`,padding:'6px 9px',borderRadius:6,lineHeight:1.5,marginTop:10,border:`1px solid ${rs.ring}18`}}>
+          {ROLE_DESC[role]}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ReplicationPage = ({data}) => {
+  const {useUTC} = useContext(TzCtx);
+  const [filter,       setFilter]       = useState('');
+  const [search,       setSearch]       = useState('');
+  const [expanded,     setExpanded]     = useState(null);
+  const [rawJson,      setRawJson]      = useState(null);
+  const [pcOpen,       setPcOpen]       = useState(null); // primary change expand index
+
+  const evts      = data.replEvents||[];
+  const clMembers = (data.cluster||{}).members||[];
+
+  // Event type counts
+  const counts = useMemo(()=>{
+    const c={};
+    evts.forEach(e=>{c[e.eventType]=(c[e.eventType]||0)+1;});
+    return c;
+  },[evts]);
+
+  // Filtered event list
+  const filtered = useMemo(()=>evts.filter(e=>
+    (!filter||e.eventType===filter)&&
+    (!search||(e.message||'').toLowerCase().includes(search.toLowerCase())||
+              (e.newPrimary||'').toLowerCase().includes(search.toLowerCase())||
+              (e.fileName||'').toLowerCase().includes(search.toLowerCase()))
+  ),[evts,filter,search]);
+
+  // Last known primary (scan from end)
+  const lastPrimary = useMemo(()=>{
+    for(let i=evts.length-1;i>=0;i--){if(evts[i].newPrimary)return evts[i].newPrimary;}
+    return null;
+  },[evts]);
+
+  // Replica set name
+  const replSetName = useMemo(()=>{
+    for(const e of evts){if(e.replicaSet)return e.replicaSet;}
+    return (data.cluster||{}).replicaSet||null;
+  },[evts,data]);
+
+  // Primary change history: deduplicate, then keep only real host changes
+  const primaryChanges = useMemo(()=>{
+    // All primary_change / election_won events, already deduped by backend per 30s bucket.
+    // Build chain and filter out same-host "changes" (prev === new).
+    const raw = evts.filter(e=>['election_won','primary_change'].includes(e.eventType)&&e.newPrimary);
+    const chain = raw.map((e,i)=>({
+      ts:e.timestamp, type:e.eventType,
+      newPrimary:e.newPrimary,
+      prevPrimary:i>0?raw[i-1].newPrimary:null,
+      term:e.term, fileName:e.fileName, rawLine:e.rawLine,
+    }));
+    // Only real failovers: either first known primary, or actual host change
+    return chain.filter(t=>!t.prevPrimary || t.prevPrimary!==t.newPrimary);
+  },[evts]);
+
+  // Topology: use config members if available, else derive from events
+  const topoMembers = useMemo(()=>{
+    if(clMembers.length>0) return clMembers;
+    const seen={};
+    evts.forEach(e=>{if(e.newPrimary&&!seen[e.newPrimary]){seen[e.newPrimary]={host:e.newPrimary,id:0,priority:1,hidden:false,arbiter:false};}});
+    return Object.values(seen);
+  },[clMembers,evts]);
+
+  // Sort: primary first, then secondaries, then passive, then hidden, then arbiter
+  const roleOrder = {primary:0,secondary:1,passive:2,hidden:3,arbiter:4};
+  const sortedMembers = useMemo(()=>[...topoMembers].sort((a,b)=>{
+    const ra=roleOrder[getRole(a,lastPrimary)]??9;
+    const rb=roleOrder[getRole(b,lastPrimary)]??9;
+    return ra-rb;
+  }),[topoMembers,lastPrimary]);
+
+  // Stats for top bar
+  const critCount = counts.stepdown||0 + (counts.rollback||0) + (counts.heartbeat_error||0);
+  const electionCount = (counts.election_won||0)+(counts.election_start||0)+(counts.election||0);
+
+  return(
+    <div style={{padding:12,display:'flex',flexDirection:'column',gap:12}}>
+
+      {/* ── 1. Topology Diagram ──────────────────────────────────────── */}
+      <Panel title={replSetName?`Replica Set — ${replSetName}`:'Replica Set Topology'} sub={`${topoMembers.length} member${topoMembers.length!==1?'s':''}`}>
+        {topoMembers.length===0?(
+          <div style={{padding:28,textAlign:'center',color:C.faint,fontSize:12}}>
+            No replica set member configuration found in logs.<br/>
+            <span style={{fontSize:11}}>Members appear once a "New replica set config in use" log line is present.</span>
+          </div>
+        ):(
+          <>
+            {/* Quorum stats bar */}
+            {(()=>{
+              const voting = topoMembers.filter(m=>!m.hidden&&!m.arbiter&&(m.priority||1)>0);
+              const quorum = Math.floor(topoMembers.length/2)+1;
+              return(
+                <div style={{display:'flex',gap:0,marginBottom:16,background:C.bg,borderRadius:8,border:`1px solid ${C.border}`,overflow:'hidden'}}>
+                  {[
+                    {label:'Total members', value:topoMembers.length, color:C.blue},
+                    {label:'Voting members', value:voting.length, color:C.teal},
+                    {label:'Quorum needed', value:quorum, color:C.amber},
+                    {label:'Current primary', value:lastPrimary||'—', color:C.green, mono:true},
+                    ...(replSetName?[{label:'Replica set', value:replSetName, color:C.violet, mono:true}]:[]),
+                    {label:'Elections', value:electionCount||0, color:C.sky},
+                    {label:'Critical events', value:critCount||0, color:C.red},
+                  ].map((s,i,arr)=>(
+                    <div key={i} style={{
+                      flex:1,padding:'10px 14px',
+                      borderRight:i<arr.length-1?`1px solid ${C.border}`:'none',
+                    }}>
+                      <div style={{fontSize:9,fontWeight:500,color:C.faint,textTransform:'uppercase',letterSpacing:'.05em',marginBottom:4}}>{s.label}</div>
+                      <div style={{fontSize:s.mono&&String(s.value).length>14?10:13,fontWeight:700,color:s.color,fontFamily:s.mono?'ui-monospace,monospace':undefined,wordBreak:'break-all'}}>{s.value}</div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+            {/* Member cards */}
+            <div style={{display:'flex',flexWrap:'wrap',gap:12,marginBottom:16}}>
+              {sortedMembers.map((m,i)=><TopoCard key={i} m={m} lastPrimary={lastPrimary}/>)}
+            </div>
+            {/* Legend */}
+            <div style={{display:'flex',gap:16,flexWrap:'wrap',borderTop:`1px solid ${C.border}`,paddingTop:10,alignItems:'center'}}>
+              {Object.entries(ROLE_STYLE).map(([role,rs])=>(
+                <div key={role} style={{display:'flex',alignItems:'center',gap:5}}>
+                  <span style={{width:7,height:7,borderRadius:'50%',background:rs.ring,display:'inline-block',flexShrink:0}}/>
+                  <span style={{fontSize:10,color:C.muted,textTransform:'capitalize'}}>{role}</span>
+                </div>
+              ))}
+              <span style={{fontSize:10,color:C.faint,marginLeft:'auto'}}>Top border color indicates role</span>
+            </div>
+          </>
+        )}
+      </Panel>
+
+      {/* ── 2. Primary Change History ─────────────────────────────────── */}
+      {primaryChanges.length>0&&(
+        <Panel title="Primary Change History" sub={`${primaryChanges.length} failover${primaryChanges.length!==1?'s':''} · click row to view raw JSON`}>
+          <div style={{display:'flex',flexDirection:'column',gap:2}}>
+            {primaryChanges.map((t,i)=>{
+              const isOpen = pcOpen===i;
+              let prettyRaw='';
+              if(isOpen&&t.rawLine){try{prettyRaw=JSON.stringify(JSON.parse(t.rawLine),null,2);}catch{prettyRaw=t.rawLine;}}
+              return(
+                <div key={i}>
+                  {/* Main row */}
+                  <div onClick={()=>t.rawLine&&setPcOpen(isOpen?null:i)} style={{
+                    display:'flex',alignItems:'center',gap:10,padding:'8px 12px',
+                    borderRadius:isOpen?'6px 6px 0 0':6,
+                    border:`1px solid ${isOpen?C.blue+'40':C.border2}`,
+                    background:isOpen?C.blue+'06':'transparent',
+                    cursor:t.rawLine?'pointer':'default',
+                  }}>
+                    <div style={{width:22,height:22,borderRadius:'50%',background:`${C.blue}12`,color:C.blue,fontSize:10,fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+                      {i+1}
+                    </div>
+                    <span style={{fontSize:10,fontFamily:'ui-monospace,monospace',color:C.faint,minWidth:140,flexShrink:0}}>{fmtDate(t.ts,useUTC)}</span>
+                    <div style={{display:'flex',alignItems:'center',gap:8,flex:1}}>
+                      {t.prevPrimary
+                        ? <span style={{fontFamily:'ui-monospace,monospace',fontSize:11,color:C.muted,background:C.surface2,padding:'2px 8px',borderRadius:4,border:`1px solid ${C.border}`}}>{t.prevPrimary}</span>
+                        : <span style={{fontSize:10,color:C.faint,fontStyle:'italic'}}>previous unknown</span>}
+                      <span style={{color:C.faint}}>→</span>
+                      <span style={{fontFamily:'ui-monospace,monospace',fontSize:11,fontWeight:700,color:C.green,background:'#f0fdf6',padding:'2px 9px',borderRadius:4,border:'1px solid #86efac40'}}>{t.newPrimary}</span>
+                      {t.term>0&&<span style={{fontSize:10,color:C.faint,padding:'1px 6px',borderRadius:4,border:`1px solid ${C.border}`,background:C.surface2}}>term {t.term}</span>}
+                    </div>
+                    <span style={{fontSize:9,fontFamily:'ui-monospace,monospace',color:C.faint,flexShrink:0}}>{trunc(t.fileName,28)}</span>
+                    {t.rawLine&&<span style={{color:C.faint,fontSize:10,flexShrink:0,transform:isOpen?'rotate(90deg)':'none',transition:'transform .15s'}}>›</span>}
+                  </div>
+                  {/* Raw JSON expand */}
+                  {isOpen&&t.rawLine&&(
+                    <div style={{borderRadius:'0 0 6px 6px',background:'#1c2027',border:`1px solid ${C.blue+'30'}`,borderTop:'none',overflow:'auto',maxHeight:300}}>
+                      <div style={{padding:'6px 12px',borderBottom:'1px solid #2d3748',display:'flex',justifyContent:'space-between'}}>
+                        <span style={{fontSize:9,fontWeight:600,color:'#4b5563',textTransform:'uppercase',letterSpacing:'.05em'}}>Raw JSON</span>
+                        <span style={{fontSize:9,color:'#4b5563'}}>{t.fileName}</span>
+                      </div>
+                      <pre style={{margin:0,padding:'10px 14px',fontFamily:'ui-monospace,monospace',fontSize:10,lineHeight:1.6,color:'#e5e7eb',whiteSpace:'pre',overflowX:'auto'}}>{prettyRaw}</pre>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      )}
+
+      {/* ── 3. Filter chips + search ───────────────────────────────────── */}
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <div style={{display:'flex',gap:5,flexWrap:'wrap',flex:1}}>
+          {Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([t,c])=>{
+            const dc=REPL_DOT[t]||C.faint;
+            const active=filter===t;
+            return(
+              <button key={t} onClick={()=>setFilter(f=>f===t?'':t)} style={{
+                display:'flex',alignItems:'center',gap:5,padding:'4px 11px',borderRadius:20,
+                fontSize:11,fontWeight:500,cursor:'pointer',
+                background:active?`${dc}18`:C.surface,
+                border:`1px solid ${active?`${dc}50`:C.border}`,
+                color:active?dc:C.muted,
+                boxShadow:active?`0 0 0 2px ${dc}18`:undefined,
+              }}>
+                <Dot color={dc}/>{REPL_LABEL[t]||t.replace(/_/g,' ')} <strong style={{marginLeft:2}}>{c}</strong>
+              </button>
+            );
+          })}
+          {filter&&<button onClick={()=>setFilter('')} style={{padding:'4px 11px',borderRadius:20,fontSize:11,color:C.muted,border:`1px solid ${C.border}`,background:C.surface,cursor:'pointer'}}>Clear ×</button>}
+        </div>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search message, host, file…"
+          style={{padding:'5px 11px',border:`1px solid ${C.border}`,borderRadius:8,fontSize:11,background:C.surface,color:C.text,outline:'none',width:220}}/>
+      </div>
+
+      {/* ── 4. Event Log Table ─────────────────────────────────────────── */}
+      <Panel title="Event Log" sub={`${filtered.length} of ${evts.length} events`} pad={false}>
+        <div style={{overflowX:'auto',maxHeight:700,overflowY:'auto'}}>
+          {filtered.length===0&&<div style={{padding:40,textAlign:'center',color:C.faint}}>No events match the current filters</div>}
+          <table style={{fontSize:11,width:'100%',minWidth:700}}>
+            <thead>
+              <tr style={{borderBottom:`1px solid ${C.border}`,background:C.surface2,position:'sticky',top:0,zIndex:1}}>
+                {['Time','Event','Sev','Message','→ Primary','Term','File'].map(h=>(
+                  <th key={h} style={{padding:'7px 14px',textAlign:'left',fontSize:10,fontWeight:600,color:C.muted,whiteSpace:'nowrap',letterSpacing:'.02em'}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((ev,i)=>{
+                const dc=REPL_DOT[ev.eventType]||C.faint;
+                const isCrit=['stepdown','heartbeat_error','rollback'].includes(ev.eventType);
+                const isOpen=expanded===i;
+                return(
+                  <React.Fragment key={i}>
+                    <tr onClick={()=>setExpanded(isOpen?null:i)} style={{
+                      borderBottom:`1px solid ${isOpen?'#2d3748':C.border2}`,
+                      background:isOpen?'#1c2027':isCrit?`${dc}06`:'transparent',
+                      cursor:ev.rawLine?'pointer':'default',
+                    }}>
+                      <td style={{padding:'6px 14px',fontFamily:'ui-monospace,monospace',color:isOpen?'#6b7280':'#9ca3af',fontSize:10,whiteSpace:'nowrap'}}>{fmtDate(ev.timestamp,useUTC)}</td>
+                      <td style={{padding:'6px 14px',whiteSpace:'nowrap'}}>
+                        <span style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:10,fontWeight:600,padding:'2px 8px',borderRadius:4,background:`${dc}22`,color:dc}}>
+                          <Dot color={dc}/>{REPL_LABEL[ev.eventType]||ev.eventType}
+                        </span>
+                      </td>
+                      <td style={{padding:'6px 14px'}}><SevBadge s={ev.severity}/></td>
+                      <td style={{padding:'6px 14px',color:isOpen?'#d1d5db':isCrit?C.red:C.sub,maxWidth:380}}>{trunc(ev.message,90)}</td>
+                      <td style={{padding:'6px 14px',fontFamily:'ui-monospace,monospace',color:C.green,fontWeight:600,fontSize:10,whiteSpace:'nowrap'}}>{ev.newPrimary||'—'}</td>
+                      <td style={{padding:'6px 14px',color:isOpen?'#6b7280':C.faint,fontSize:10}}>{ev.term>0?ev.term:'—'}</td>
+                      <td style={{padding:'6px 14px',color:isOpen?'#6b7280':C.faint,fontSize:10,maxWidth:160}}>{trunc(ev.fileName,22)}</td>
+                    </tr>
+                    {isOpen&&ev.rawLine&&(
+                      <tr style={{borderBottom:`1px solid #2d3748`}}>
+                        <td colSpan={7} style={{padding:0}}>
+                          <div style={{background:'#1c2027',borderBottom:`1px solid #2d3748`}}>
+                            <div style={{padding:'6px 14px',borderBottom:'1px solid #2d3748',display:'flex',justifyContent:'space-between'}}>
+                              <span style={{fontSize:9,fontWeight:600,color:'#4b5563',textTransform:'uppercase',letterSpacing:'.05em'}}>Raw JSON</span>
+                              <span style={{fontSize:9,color:'#4b5563'}}>{ev.fileName}</span>
+                            </div>
+                            <pre style={{
+                              margin:0,padding:'10px 14px',
+                              fontFamily:'ui-monospace,monospace',fontSize:10,lineHeight:1.6,
+                              color:'#e5e7eb',whiteSpace:'pre',overflowX:'auto',maxHeight:320,overflowY:'auto',
+                            }} dangerouslySetInnerHTML={{__html:highlightJson(ev.rawLine)}}/>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  );
+};
+
+// ─── MESSAGES ───────────────────────────────────────────────────────────────
+const MessagesPage = ({data}) => {
+  const [filter,    setFilter]    = useState('');
+  const [sevFilter, setSevFilter] = useState('');
+  const all   = data.messageGroups||[];
+  const top20 = all.slice(0,20).map((g,i)=>({...g,fill:PAL[i%PAL.length]}));
+
+  const rows = useMemo(()=>all.filter(g=>
+    (!filter||g.message.toLowerCase().includes(filter.toLowerCase()))&&
+    (!sevFilter||g.severity===sevFilter)
+  ),[all,filter,sevFilter]);
+
+  return(
+    <div style={{padding:12,display:'flex',flexDirection:'column',gap:10}}>
+      <Panel title="Top 20 messages by count">
+        <div style={{display:'flex',flexDirection:'column',gap:5}}>
+          {top20.map((d,i)=>{
+            const max=top20[0]?.count||1;
+            return(
+              <div key={i}>
+                <div style={{display:'flex',justifyContent:'space-between',marginBottom:2}}>
+                  <span style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1,paddingRight:10}}
+                    title={d.message}>{d.message?.length>80?d.message.slice(0,80)+'…':d.message}</span>
+                  <span style={{fontSize:11,fontWeight:600,color:d.fill,fontVariantNumeric:'tabular-nums',flexShrink:0}}>{d.count.toLocaleString()}</span>
+                </div>
+                <div style={{height:3,background:C.bg,borderRadius:2}}>
+                  <div style={{height:'100%',width:`${d.count/max*100}%`,background:d.fill,borderRadius:2}}/>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Panel>
+
+      <Panel title="All message groups" sub={`${rows.length} groups`} pad={false}
+        action={
+          <div style={{display:'flex',alignItems:'center',gap:6}}>
+            <select value={sevFilter} onChange={e=>setSevFilter(e.target.value)} style={{
+              fontSize:11,background:C.surface,border:`1px solid ${C.border}`,borderRadius:4,
+              color:C.sub,padding:'3px 6px',outline:'none',
+            }}>
+              <option value="">All</option>
+              {['F','E','W','I'].map(s=><option key={s} value={s}>{s}</option>)}
+            </select>
+            <div style={{position:'relative'}}>
+              <span style={{position:'absolute',left:7,top:'50%',transform:'translateY(-50%)',color:C.faint,fontSize:11}}>⌕</span>
+              <input value={filter} onChange={e=>setFilter(e.target.value)} style={{
+                paddingLeft:20,paddingRight:8,paddingTop:3,paddingBottom:3,fontSize:11,
+                background:C.surface,border:`1px solid ${C.border}`,borderRadius:4,color:C.text,outline:'none',width:170,
+              }} placeholder="Filter…"/>
+            </div>
+          </div>
+        }>
+        <div style={{overflowX:'auto',maxHeight:500,overflowY:'auto'}}>
+          <table style={{fontSize:11}}>
+            <thead style={{position:'sticky',top:0,zIndex:10}}>
+              <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                {['#','Message','Count','Component','Severity'].map(h=>(
+                  <th key={h} style={{padding:'5px 12px',textAlign:'left',fontSize:10,fontWeight:500,color:C.faint,background:C.surface2}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((g,i)=>(
+                <tr key={i} style={{borderBottom:`1px solid ${C.border2}`}}
+                    onMouseEnter={e=>e.currentTarget.style.background='#f9fafb'}
+                    onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <td style={{padding:'4px 12px',color:C.faint,fontVariantNumeric:'tabular-nums'}}>{i+1}</td>
+                  <td style={{padding:'4px 12px',color:C.text,maxWidth:480,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={g.message}>{g.message}</td>
+                  <td style={{padding:'4px 12px',fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{N(g.count)}</td>
+                  <td style={{padding:'4px 12px',fontFamily:'ui-monospace,monospace',color:C.muted,fontSize:10}}>{g.component||'—'}</td>
+                  <td style={{padding:'4px 12px'}}><SevBadge s={g.severity}/></td>
+                </tr>
+              ))}
+              {!rows.length&&<tr><td colSpan={5} style={{padding:36,textAlign:'center',color:C.faint}}>No messages found</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  );
+};
+
+// ─── CONNECTIONS ─────────────────────────────────────────────────────────────
+const ConnectionsPage = ({data}) => {
+  const {useUTC} = useContext(TzCtx);
+  const cs = data.connStats || {};
+  const hourly = (cs.hourly || []).map(h => ({...h, label: fmtMin(h.hour,useUTC)}));
+  const clients = cs.topClients || [];
+  const apps    = cs.topApps   || [];
+  const users   = cs.topUsers  || [];
+  const hasConnData = cs.totalOpened > 0 || cs.totalClosed > 0;
+  const hasAuthData = users.length > 0;
+  const hasAppData  = apps.length > 0;
+  const leak = (cs.totalOpened||0) - (cs.totalClosed||0);
+
+  const maxClient = clients.length > 0 ? clients[0].count : 1;
+
+  return (
+    <div style={{padding:16, display:'flex', flexDirection:'column', gap:12}}>
+
+      {/* Stats row */}
+      <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))', gap:10}}>
+        <Stat label="Connections opened"  value={N(cs.totalOpened||0)}  accent={C.blue}/>
+        <Stat label="Connections closed"  value={N(cs.totalClosed||0)}  accent={C.teal}/>
+        <Stat label="Peak concurrent"     value={N(cs.peakCount||0)}    accent={C.amber} sub="max connectionCount seen"/>
+        <Stat label="Unique client IPs"   value={N(cs.uniqueClients||0)} accent={C.green}/>
+        <Stat label="Auth failures"       value={N(cs.authFailures||0)} accent={(cs.authFailures||0)>0?C.red:C.faint}/>
+        {(cs.gssapiErrors||0)>0&&<Stat label="GSSAPI errors" value={N(cs.gssapiErrors)} accent={C.red} sub="Kerberos step failures"/>}
+        {cs.totalOpened > 0 && cs.totalClosed > 0 && (
+          <Stat label="Leak (open − closed)" value={N(leak)} accent={leak > 100 ? C.amber : C.faint} sub="approx, may cross log boundaries"/>
+        )}
+      </div>
+
+      {/* No data notice */}
+      {!hasConnData && !hasAppData && !hasAuthData && (
+        <Panel title="No connection data found">
+          <div style={{padding:'24px 0', color:C.faint, textAlign:'center', lineHeight:2}}>
+            No "Connection accepted" / "Connection ended" log lines were found.<br/>
+            <span style={{fontSize:11}}>These come from the <strong>NETWORK</strong> component — make sure your log verbosity includes them.</span>
+          </div>
+        </Panel>
+      )}
+
+      {/* Connections over time chart */}
+      {hourly.length > 0 && (
+        <Panel title="Connections over time" pad={false} sub={`${hourly.length} buckets`}>
+          {(()=>{
+            const labels    = hourly.map(h=>h.label);
+            const openVals  = hourly.map(h=>h.opened||0);
+            const closeVals = hourly.map(h=>h.closed||0);
+            const opt = {
+              animation:false,
+              grid:{top:8,right:12,bottom:22,left:40},
+              xAxis:{type:'category',data:labels,axisLine:{show:false},axisTick:{show:false},axisLabel:{fontSize:9,color:C.faint,interval:'auto'}},
+              yAxis:{type:'value',axisLine:{show:false},axisTick:{show:false},minInterval:1,splitLine:{lineStyle:{color:GRID,type:'dashed'}},axisLabel:{fontSize:9,color:C.faint}},
+              ...ZOOM_CFG,
+              tooltip:{
+                trigger:'axis',confine:true,
+                axisPointer:{type:'line',lineStyle:{color:'rgba(150,150,150,0.25)',type:'dashed',width:1}},
+                backgroundColor:'#1c2027',borderWidth:0,padding:[6,10],
+                textStyle:{color:'#f3f4f6',fontSize:11},
+                formatter:p=>{
+                  const pts=p.filter(s=>s.value>0).map(s=>`<div style="display:flex;align-items:center;gap:6px;margin-top:3px"><span style="width:7px;height:7px;border-radius:50%;background:${s.color};display:inline-block;flex-shrink:0"></span><span style="color:#9ca3af">${s.seriesName}:</span><b style="color:${s.color};margin-left:4px">${s.value}</b></div>`).join('');
+                  return `<div style="color:#9ca3af;font-size:10px;margin-bottom:2px">${p[0]?.name}</div>${pts}`;
+                },
+              },
+              series:[
+                {name:'Opened',type:'line',data:openVals, smooth:false,symbol:'none',lineStyle:{color:C.blue,width:1.5},areaStyle:{color:C.blue+'18'}},
+                {name:'Closed',type:'line',data:closeVals,smooth:false,symbol:'none',lineStyle:{color:C.teal,width:1.5},areaStyle:{color:C.teal+'18'}},
+              ],
+            };
+            return (
+              <div style={{padding:'12px 16px 4px'}}>
+                <EChart option={opt} height={200}/>
+                <div style={{display:'flex',gap:14,paddingTop:6,paddingLeft:4}}>
+                  {[{name:'Opened',color:C.blue},{name:'Closed',color:C.teal}].map(s=>(
+                    <span key={s.name} style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:10,color:C.muted}}>
+                      <span style={{width:18,height:2,background:s.color,display:'inline-block',borderRadius:1}}/>
+                      {s.name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+        </Panel>
+      )}
+
+      {/* Top clients */}
+      {clients.length > 0 && (
+        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:10}}>
+          {/* Bar list */}
+          <Panel title="Top client IPs" sub={`${cs.uniqueClients} unique IPs`}>
+            <div style={{display:'flex',flexDirection:'column',gap:6}}>
+              {clients.slice(0,15).map((d,i)=>{
+                const pct=cs.totalOpened>0?d.count/cs.totalOpened*100:0;
+                return(
+                  <div key={i}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:2}}>
+                      <span style={{fontSize:10,fontFamily:'ui-monospace,monospace',color:C.sub}}>{d.remote}</span>
+                      <span style={{fontSize:10,color:C.faint,fontVariantNumeric:'tabular-nums'}}>{d.count.toLocaleString()} · {pct.toFixed(1)}%</span>
+                    </div>
+                    <div style={{height:3,background:C.bg,borderRadius:2}}>
+                      <div style={{height:'100%',width:`${d.count/maxClient*100}%`,background:C.blue,borderRadius:2}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+
+          {/* Table */}
+          <Panel title="Client connection counts" pad={false}>
+            <div style={{overflowY:'auto', maxHeight:360}}>
+              <table style={{fontSize:11, width:'100%'}}>
+                <thead>
+                  <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                    {['#','Client IP','Connections','Share'].map(h=>(
+                      <th key={h} style={{padding:'8px 16px',textAlign:'left',fontSize:10,fontWeight:600,color:C.muted,background:C.surface2,whiteSpace:'nowrap'}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {clients.map((c,i)=>{
+                    const pct = cs.totalOpened > 0 ? (c.count/cs.totalOpened*100) : 0;
+                    return(
+                      <tr key={i} style={{borderBottom:`1px solid ${C.border2}`}}
+                          onMouseEnter={e=>e.currentTarget.style.background=C.surface2}
+                          onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                        <td style={{padding:'5px 14px',color:C.faint,fontSize:10}}>{i+1}</td>
+                        <td style={{padding:'5px 14px',fontFamily:'ui-monospace,monospace',color:C.sub,fontSize:11}}>{c.remote}</td>
+                        <td style={{padding:'5px 14px',fontWeight:600,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{N(c.count)}</td>
+                        <td style={{padding:'5px 14px',minWidth:100}}>
+                          <div style={{display:'flex',alignItems:'center',gap:6}}>
+                            <div style={{flex:1,height:3,background:C.border,borderRadius:2}}>
+                              <div style={{height:'100%',borderRadius:2,width:`${Math.min(100,c.count/maxClient*100)}%`,background:PAL[i%PAL.length]}}/>
+                            </div>
+                            <span style={{fontSize:10,color:C.muted,minWidth:36,textAlign:'right'}}>{pct.toFixed(1)}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* Application names */}
+      {hasAppData && (
+        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
+          {/* Bar list */}
+          <Panel title="Client applications" sub={`${apps.length} distinct apps`}>
+            <div style={{display:'flex',flexDirection:'column',gap:6}}>
+              {apps.slice(0,12).map((d,i)=>{
+                const max=apps[0]?.count||1;
+                const color=PAL[i%PAL.length];
+                return(
+                  <div key={i}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:2}}>
+                      <span style={{fontSize:11,color:C.sub,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1,paddingRight:8}}>{d.name}</span>
+                      <span style={{fontSize:10,color:C.faint,fontVariantNumeric:'tabular-nums',flexShrink:0}}>{d.count.toLocaleString()}</span>
+                    </div>
+                    <div style={{height:3,background:C.bg,borderRadius:2}}>
+                      <div style={{height:'100%',width:`${d.count/max*100}%`,background:color,borderRadius:2}}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+          {/* Table */}
+          <Panel title="App connection counts" pad={false}>
+            <div style={{overflowY:'auto', maxHeight:380}}>
+              <table style={{fontSize:11, width:'100%'}}>
+                <thead>
+                  <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                    {['#','Application / Driver','Connections'].map(h=>(
+                      <th key={h} style={{padding:'8px 16px',textAlign:'left',fontSize:10,fontWeight:600,color:C.muted,background:C.surface2,whiteSpace:'nowrap'}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {apps.map((a,i)=>(
+                    <tr key={i} style={{borderBottom:`1px solid ${C.border2}`}}
+                        onMouseEnter={e=>e.currentTarget.style.background=C.surface2}
+                        onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                      <td style={{padding:'6px 16px',color:C.faint,fontSize:10}}>{i+1}</td>
+                      <td style={{padding:'6px 16px',color:C.text,fontSize:11}}>
+                        <div style={{fontWeight:500}}>{a.name}</div>
+                        {a.driver&&a.driver!==a.name&&<div style={{fontSize:10,color:C.faint,marginTop:1}}>{a.driver}</div>}
+                      </td>
+                      <td style={{padding:'6px 16px',fontWeight:600,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{N(a.count)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* Authenticated users */}
+      {hasAuthData && (
+        <Panel title="Authenticated users" sub={`${users.length} distinct users`} pad={false}>
+          <div style={{overflowY:'auto', maxHeight:420}}>
+            <table style={{fontSize:11, width:'100%'}}>
+              <thead>
+                <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                  {['#','User','DB','Mechanism','Logins','Failures','Role'].map(h=>(
+                    <th key={h} style={{padding:'8px 16px',textAlign:'left',fontSize:10,fontWeight:600,color:C.muted,background:C.surface2,whiteSpace:'nowrap'}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {users.map((u,i)=>{
+                  const hasFail = u.failures > 0;
+                  return (
+                    <tr key={i} style={{borderBottom:`1px solid ${C.border2}`}}
+                        onMouseEnter={e=>e.currentTarget.style.background=C.surface2}
+                        onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                      <td style={{padding:'6px 16px',color:C.faint,fontSize:10}}>{i+1}</td>
+                      <td style={{padding:'6px 16px',fontFamily:'ui-monospace,Menlo,Monaco,monospace',color:C.text,fontSize:10,maxWidth:340,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={u.user}>{u.user}</td>
+                      <td style={{padding:'6px 16px',color:C.muted,fontSize:10}}>{u.db||'—'}</td>
+                      <td style={{padding:'6px 16px'}}>
+                        {u.mechanism
+                          ? <span style={{fontSize:9,padding:'2px 7px',borderRadius:20,fontWeight:600,
+                              background:u.mechanism==='SCRAM-SHA-256'?`${C.green}15`:u.mechanism==='MONGODB-X509'?`${C.blue}15`:u.mechanism==='GSSAPI'?`${C.violet}15`:`${C.faint}12`,
+                              color:u.mechanism==='SCRAM-SHA-256'?C.green:u.mechanism==='MONGODB-X509'?C.blue:u.mechanism==='GSSAPI'?C.violet:C.faint,
+                            }}>{u.mechanism}</span>
+                          : <span style={{color:C.faint}}>—</span>
+                        }
+                      </td>
+                      <td style={{padding:'6px 16px',fontWeight:600,color:C.blue,fontVariantNumeric:'tabular-nums'}}>{N(u.count)}</td>
+                      <td style={{padding:'6px 16px',fontWeight:hasFail?700:400,color:hasFail?C.red:C.faint,fontVariantNumeric:'tabular-nums'}}>{u.failures>0?N(u.failures):'—'}</td>
+                      <td style={{padding:'6px 16px'}}>
+                        {u.isCluster
+                          ? <span style={{fontSize:9,padding:'2px 7px',borderRadius:20,background:`${C.violet}15`,color:C.violet,fontWeight:600}}>cluster peer</span>
+                          : <span style={{fontSize:9,padding:'2px 7px',borderRadius:20,background:`${C.teal}15`,color:C.teal,fontWeight:600}}>client</span>
+                        }
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
+    </div>
+  );
+};
+
+// ─── QUERY MODAL ────────────────────────────────────────────────────────────
+const QueryModal = ({q, onClose}) => {
+  useEffect(()=>{
+    const h=e=>{if(e.key==='Escape')onClose();};
+    window.addEventListener('keydown',h);
+    return()=>window.removeEventListener('keydown',h);
+  },[]);
+  if(!q) return null;
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:50,display:'flex',alignItems:'center',justifyContent:'center',padding:16,background:'rgba(0,0,0,.35)'}}
+         onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{
+        width:'100%',maxWidth:760,maxHeight:'90vh',display:'flex',flexDirection:'column',
+        background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,
+        boxShadow:'0 8px 32px rgba(0,0,0,.18)',overflow:'hidden',
+      }}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'12px 18px',borderBottom:`1px solid ${C.border}`,background:C.surface2}}>
+          <div>
+            <div style={{fontWeight:700,color:C.text,fontSize:13,letterSpacing:'.01em'}}>{q.namespace||'Query detail'}</div>
+            {q.queryHash&&<div style={{fontSize:10,fontFamily:'ui-monospace,monospace',color:C.faint,marginTop:2}}>{q.queryHash}</div>}
+          </div>
+          <button onClick={onClose} style={{fontSize:18,color:C.faint,background:'none',border:'none',lineHeight:1,padding:'4px 6px',cursor:'pointer',borderRadius:6,transition:'background .1s'}}
+            onMouseOver={e=>e.currentTarget.style.background=C.bg} onMouseOut={e=>e.currentTarget.style.background='none'}>×</button>
+        </div>
+
+        <div style={{flex:1,overflowY:'auto',padding:16,display:'flex',flexDirection:'column',gap:14}}>
+          {/* Plan + cmd + sharded badge + files */}
+          <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+            <PlanBadge plan={q.planSummary||(q.isSharded?'SHARDED':undefined)}/>
+            {q.commandType&&<Tag>{q.commandType}</Tag>}
+            {q.isSharded&&<Tag color={C.sky}>sharded</Tag>}
+            {(q.files||[]).map((f,i)=>(<Tag key={i} color={C.faint}>{f}</Tag>))}
+          </div>
+
+          {/* Remote wait banner — only when significant */}
+          {q.remoteWaitPct>=50&&(
+            <div style={{
+              display:'flex',alignItems:'center',gap:10,padding:'9px 14px',
+              background:'#fff7ed',border:'1px solid #fed7aa60',borderRadius:8,
+            }}>
+              <span style={{fontSize:13}}>⏱</span>
+              <div style={{flex:1}}>
+                <span style={{fontWeight:600,color:C.orange,fontSize:12}}>
+                  {F1(q.remoteWaitPct)}% remote wait
+                </span>
+                <span style={{fontSize:11,color:C.muted,marginLeft:6}}>
+                  — avg {ms(Math.round(q.avgRemoteWaitMs))} of {ms(Math.round(q.avgDuration))} spent waiting for shard / write concern ack
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Stats grid */}
+          <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+            {[
+              {l:'Max duration',      v:ms(q.maxDuration),                        c:C.red},
+              {l:'Avg duration',      v:ms(Math.round(q.avgDuration)),             c:C.amber},
+              {l:'Min duration',      v:ms(q.minDuration),                        c:C.green},
+              {l:'Executions',        v:N(q.count)+'×',                           c:C.blue},
+              {l:'Total time',        v:ms(q.totalDuration),                      c:C.muted},
+              {l:'Avg remote wait',   v:q.avgRemoteWaitMs>0?ms(Math.round(q.avgRemoteWaitMs)):'—', c:q.remoteWaitPct>=50?C.orange:C.muted},
+              {l:'Avg docs',          v:N(Math.round(q.avgDocsExamined)),         c:C.amber},
+              {l:'Avg keys',          v:N(Math.round(q.avgKeysExamined)),         c:C.green},
+              {l:'Avg returned',      v:N(Math.round(q.avgNReturned)),            c:C.teal},
+              {l:'Avg reslen',        v:bytes(q.avgResLen),                       c:q.avgResLen>102400?C.red:C.muted},
+              {l:'Avg yields',        v:F1(q.avgNumYields),                       c:q.avgNumYields>10?C.amber:C.muted},
+              {l:'Inefficiency',      v:null,                                     c:null,badge:true},
+            ].filter(s=>s.v!='—'||s.badge).map((s,i)=>(
+              <div key={i} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:5,padding:'8px 10px'}}>
+                <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.05em',fontWeight:500,color:C.faint,marginBottom:4}}>{s.l}</div>
+                {s.badge
+                  ? <div style={{display:'flex',alignItems:'center'}}><IneffBadge v={q.inefficiency}/></div>
+                  : <div style={{fontSize:14,fontWeight:600,color:s.c,fontVariantNumeric:'tabular-nums'}}>{s.v}</div>
+                }
+              </div>
+            ))}
+          </div>
+
+          {/* Command JSON */}
+          <div>
+            <div style={{fontSize:9,textTransform:'uppercase',letterSpacing:'.06em',fontWeight:500,color:C.faint,marginBottom:5}}>Command</div>
+            <pre style={{
+              fontSize:10,lineHeight:1.6,background:'#1c2027',border:'none',
+              borderRadius:6,padding:'12px 14px',overflow:'auto',maxHeight:280,
+              fontFamily:'ui-monospace,monospace',margin:0,color:'#e5e7eb',
+            }} dangerouslySetInnerHTML={{__html:highlightJson(q.exampleCommand)}}/>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── TIMELINE ────────────────────────────────────────────────────────────────
+
+const TL_CFG = {
+  crash:             { color:'#ef4444', label:'Crash' },
+  unclean_shutdown:  { color:'#ef4444', label:'Unclean shutdown' },
+  rollback:          { color:'#f97316', label:'Rollback' },
+  shutdown:          { color:'#6b7a8d', label:'Shutdown' },
+  shutdown_start:    { color:'#9aa3b2', label:'Shutdown init' },
+  restart:           { color:'#d97706', label:'Restart' },
+  startup:           { color:'#16a34a', label:'Starting' },
+  startup_done:      { color:'#16a34a', label:'Ready' },
+  primary_change:    { color:'#3b82f6', label:'Primary change' },
+  stepdown:          { color:'#d97706', label:'Stepdown' },
+  initial_sync:      { color:'#0ea5e9', label:'Initial sync' },
+  initial_sync_done: { color:'#16a34a', label:'Sync done' },
+  election:          { color:'#8b5cf6', label:'Election' },
+};
+const TL_DEFAULT = { color:'#9aa3b2', label:'Event' };
+
+// ─── Timeline row with expandable raw JSON ───────────────────────────────────
+const TimelineRow = ({ev, ei, isLast}) => {
+  const {useUTC} = useContext(TzCtx);
+  const [open, setOpen] = useState(false);
+  const cfg = TL_CFG[ev.type]||TL_DEFAULT;
+  const isCritical = ev.severity==='critical'||ev.severity==='warning';
+  const hasRaw = !!(ev.rawLine);
+
+  let prettyRaw = '';
+  if (open && hasRaw) {
+    try { prettyRaw = JSON.stringify(JSON.parse(ev.rawLine), null, 2); }
+    catch(_) { prettyRaw = ev.rawLine; }
+  }
+
+  return(
+    <div style={{position:'relative',marginBottom:isLast?0:2}}>
+      {/* Dot on the vertical track */}
+      <div style={{
+        position:'absolute',left:-28,top:14,
+        width:10,height:10,borderRadius:'50%',
+        background:isCritical?cfg.color:'#fff',
+        border:`2px solid ${cfg.color}`,
+        zIndex:1,
+      }}/>
+
+      {/* Main row — clickable */}
+      <div
+        onClick={()=>hasRaw&&setOpen(o=>!o)}
+        style={{
+          display:'flex',alignItems:'center',gap:10,
+          padding:'6px 12px',borderRadius:6,
+          background: open ? cfg.color+'08' : (isCritical?cfg.color+'06':'transparent'),
+          border:`1px solid ${open?cfg.color+'40':C.border2}`,
+          borderLeft:`3px solid ${cfg.color}`,
+          cursor:hasRaw?'pointer':'default',
+          transition:'background .12s,border-color .12s',
+          userSelect:'none',
+        }}
+      >
+        {/* Type badge */}
+        <span style={{
+          fontSize:9,fontWeight:700,color:cfg.color,
+          textTransform:'uppercase',letterSpacing:'.06em',
+          whiteSpace:'nowrap',minWidth:96,flexShrink:0,
+        }}>{cfg.label}</span>
+
+        {/* Timestamp */}
+        <span style={{fontFamily:'ui-monospace,monospace',fontSize:10,color:C.muted,whiteSpace:'nowrap',flexShrink:0}}>
+          {fmtDate(ev.timestamp,useUTC)}
+        </span>
+
+        {/* Details */}
+        {(ev.details||ev.message)&&(
+          <span style={{fontSize:11,color:C.text,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>
+            {ev.details||ev.message}
+          </span>
+        )}
+
+        {/* Source file */}
+        {ev.fileName&&(
+          <span style={{fontFamily:'ui-monospace,monospace',fontSize:9,color:C.faint,whiteSpace:'nowrap',flexShrink:0}}>
+            {ev.fileName}
+          </span>
+        )}
+
+        {/* Expand chevron */}
+        {hasRaw&&(
+          <span style={{color:C.faint,fontSize:10,flexShrink:0,transform:open?'rotate(90deg)':'none',transition:'transform .15s'}}>›</span>
+        )}
+      </div>
+
+      {/* Expanded raw JSON */}
+      {open&&hasRaw&&(
+        <div style={{
+          margin:'4px 0 4px 0',
+          borderRadius:6,
+          background:'#1d1d1f',
+          border:`1px solid #3a3a3c`,
+          overflow:'auto',
+          maxHeight:320,
+        }}>
+          <div style={{
+            display:'flex',alignItems:'center',justifyContent:'space-between',
+            padding:'6px 12px',borderBottom:'1px solid #3a3a3c',
+          }}>
+            <span style={{fontSize:9,fontWeight:600,color:'#636366',textTransform:'uppercase',letterSpacing:'.06em'}}>Raw JSON</span>
+            <span style={{fontSize:9,color:'#636366'}}>{ev.fileName}</span>
+          </div>
+          <pre style={{
+            margin:0,padding:'10px 14px',
+            fontFamily:'ui-monospace,"SF Mono","Fira Code",monospace',
+            fontSize:10,lineHeight:1.6,
+            color:'#e5e5ea',
+            whiteSpace:'pre',overflowX:'auto',
+          }}>{prettyRaw}</pre>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const TimelinePage = ({data}) => {
+  const {useUTC} = useContext(TzCtx);
+  const events = data.timeline || [];
+  const ha = data.hourlyActivity || [];
+
+  if(!events.length && !ha.length) return(
+    <div style={{padding:40,textAlign:'center',color:C.faint}}>No timeline data</div>
+  );
+
+  // Group into sessions (new session starts at each "startup")
+  const sessions = [];
+  let cur = null;
+  events.forEach(ev=>{
+    if(ev.type==='startup'||!cur){ cur={events:[]}; sessions.push(cur); }
+    cur.events.push(ev);
+  });
+
+  return(
+    <div style={{padding:12,display:'flex',flexDirection:'column',gap:10}}>
+      {events.length>0&&(
+        <Panel title="Server lifecycle events" sub={`${events.length} events · ${sessions.length} session${sessions.length>1?'s':''} · click row to view raw JSON`}>
+          <div style={{padding:'8px 12px'}}>
+            {sessions.map((sess,si)=>(
+              <div key={si} style={{marginBottom:si<sessions.length-1?32:0}}>
+                {/* Group separator */}
+                {sessions.length>1&&si>0&&(
+                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:16,paddingLeft:20}}>
+                    <div style={{flex:1,height:1,background:C.border2}}/>
+                    <span style={{fontSize:9,color:C.faint,whiteSpace:'nowrap'}}>{sess.events.length} events</span>
+                  </div>
+                )}
+                {/* Timeline track */}
+                <div style={{position:'relative',paddingLeft:40}}>
+                  {/* Vertical line */}
+                  <div style={{
+                    position:'absolute',left:15,top:14,
+                    width:2,borderRadius:1,
+                    bottom: sess.events.length>1 ? 14 : 'auto',
+                    height: sess.events.length>1 ? undefined : 0,
+                    background:`linear-gradient(to bottom, ${C.border}, ${C.border2})`,
+                  }}/>
+                  {sess.events.map((ev,ei)=>(
+                    <TimelineRow key={ei} ev={ev} ei={ei} isLast={ei===sess.events.length-1}/>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      )}
+    </div>
+  );
+};
+
+// ─── TOP BAR ────────────────────────────────────────────────────────────────
+const TABS = [
+  {id:'overview',     label:'Overview'},
+  {id:'slowq',        label:'Slow queries'},
+  {id:'errors',       label:'Errors'},
+  {id:'timeline',     label:'Timeline'},
+  {id:'replication',  label:'Replication'},
+  {id:'connections',  label:'Connections'},
+  {id:'messages',     label:'Messages'},
+];
+
+const TopBar = ({data, tab, setTab, useUTC, setUseUTC, logTz}) => {
+  const sev = data?.severityCounts||{};
+  const errs = (sev.E||0)+(sev.F||0);
+  const collscans = (data?.slowQueries||[]).filter(q=>(q.planSummary||'').toUpperCase().startsWith('COLLSCAN')).length;
+  const tzLabel = useUTC ? 'UTC' : (logTz ? fmtOffset(logTz) : 'Local');
+  const showToggle = logTz && logTz !== '+00:00';
+  return(
+    <header style={{
+      position:'fixed',top:0,left:0,right:0,zIndex:40,height:44,
+      background:'#fff',
+      borderBottom:`1px solid ${C.border}`,
+      display:'flex',alignItems:'center',
+    }}>
+      <div style={{
+        display:'flex',alignItems:'center',gap:7,padding:'0 18px',
+        minWidth:160,borderRight:`1px solid ${C.border}`,height:'100%',
+        fontWeight:700,fontSize:13,color:C.text,
+      }}>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2C12 2 7 8.5 7 13.5C7 16.538 9.239 19 12 19C14.761 19 17 16.538 17 13.5C17 8.5 12 2 12 2Z" fill="#3b82f6"/>
+        </svg>
+        Log Analyzer
+      </div>
+
+      <nav style={{display:'flex',height:'100%',paddingLeft:4}}>
+        {TABS.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{
+            height:'100%',padding:'0 14px',fontSize:12,fontWeight:500,
+            border:'none',position:'relative',cursor:'pointer',
+            color:tab===t.id?C.blue:C.muted,
+            background:'transparent',
+          }}>
+            {t.label}
+            {tab===t.id&&<span style={{position:'absolute',bottom:0,left:10,right:10,height:2,background:C.blue,borderRadius:'2px 2px 0 0'}}/>}
+          </button>
+        ))}
+      </nav>
+
+      <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:5,padding:'0 14px'}}>
+        {data&&<>
+          {errs>0&&<Tag color={C.red}>{N(errs)} errors</Tag>}
+          {collscans>0&&<Tag color={C.amber}>{collscans} COLLSCAN</Tag>}
+          <Tag color={C.faint}>{(data.files||[]).length} files</Tag>
+          <Tag color={C.faint}>{N(data.totalEntries)} entries</Tag>
+          <button
+            onClick={showToggle?()=>setUseUTC(v=>!v):undefined}
+            title={showToggle?(useUTC?`Switch to log timezone (${fmtOffset(logTz)})`:'Switch to UTC'):`Logs are in ${tzLabel}`}
+            style={{
+              fontSize:10,fontWeight:500,padding:'3px 8px',borderRadius:4,
+              fontFamily:'ui-monospace,monospace',
+              background:C.bg,color:C.muted,border:`1px solid ${C.border}`,
+              cursor:showToggle?'pointer':'default',
+            }}
+          >{tzLabel}</button>
+        </>}
+      </div>
+    </header>
+  );
+};
+
+// ─── APP ────────────────────────────────────────────────────────────────────
+const App = () => {
+  const [data,    setData]    = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState(null);
+  const [tab,     setTab]     = useState('overview');
+  const [modal,   setModal]   = useState(null);
+  const [useUTC,  setUseUTC]  = useState(false);
+  const [logTz,   setLogTz]   = useState(null);
+
+  useEffect(()=>{
+    fetch('/api/report')
+      .then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+      .then(d=>{
+        setData(d);
+        setLoading(false);
+        // Detect timezone from the raw start timestamp string
+        const raw = d.timeRange?.start;
+        if(raw) setLogTz(detectTzOffset(raw));
+      })
+      .catch(e=>{setError(e.message);setLoading(false);});
+  },[]);
+
+  useEffect(()=>{document.getElementById('pre-load').style.display='none';},[]);
+
+  if(loading) return(
+    <div style={{position:'fixed',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:14,background:C.bg}}>
+      <div className="spin"/>
+      <span style={{fontSize:11,color:C.faint,letterSpacing:'.05em'}}>Loading report…</span>
+    </div>
+  );
+
+  if(error) return(
+    <div style={{position:'fixed',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:8,background:C.bg}}>
+      <span style={{fontWeight:600,color:C.red,fontSize:13}}>Failed to load report</span>
+      <span style={{fontSize:11,color:C.faint}}>{error}</span>
+    </div>
+  );
+
+  return(
+    <TzCtx.Provider value={{useUTC, logTz}}>
+      <div style={{background:C.bg,minHeight:'100vh'}}>
+        <TopBar data={data} tab={tab} setTab={setTab} useUTC={useUTC} setUseUTC={setUseUTC} logTz={logTz}/>
+        <main style={{paddingTop:44}}>
+          {tab==='overview'     && <OverviewPage    data={data}/>}
+          {tab==='slowq'        && <SlowQueriesPage data={data} onModal={setModal}/>}
+          {tab==='errors'       && <ErrorsPage      data={data}/>}
+          {tab==='timeline'     && <TimelinePage    data={data}/>}
+          {tab==='replication'  && <ReplicationPage  data={data}/>}
+          {tab==='connections'  && <ConnectionsPage  data={data}/>}
+          {tab==='messages'     && <MessagesPage     data={data}/>}
+        </main>
+        {modal&&<QueryModal q={modal} onClose={()=>setModal(null)}/>}
+      </div>
+    </TzCtx.Provider>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+.DS_Store
+.claude/
+mongodb-log-analyzer
+*.exe
