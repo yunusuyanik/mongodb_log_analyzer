@@ -68,10 +68,4 @@ Then open your browser at `http://localhost:8080`.
 
 ## Supported Log Formats
 
-MongoDB structured JSON logs (version 4.4+). Make sure your MongoDB log verbosity includes the `NETWORK` component for connection tracking.
-
----
-
-## License
-
-MIT
+MongoDB structured JSON logs (version 4.4+). 
