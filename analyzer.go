@@ -27,8 +27,18 @@ type Report struct {
 	SlowTimeSeries       []SlowTimePoint    `json:"slowTimeSeries"`
 	SlowCommandTypes     []KV               `json:"slowCommandTypes"`
 	SlowPlanCounts       []KV               `json:"slowPlanCounts"`
-	ConnStats            ConnStats          `json:"connStats"`
-	Timeline             []TimelineEvent    `json:"timeline"`
+	SlowScatter          []SlowScatterPoint `json:"slowScatter"`
+	ConnStats            ConnStats            `json:"connStats"`
+	Timeline             []TimelineEvent      `json:"timeline"`
+	MemberStateHistory   []MemberStateEvent   `json:"memberStateHistory"`
+}
+
+// SlowScatterPoint is a single slow query execution for the scatter chart.
+// T is Unix milliseconds, D is durationMillis, NS is the namespace.
+type SlowScatterPoint struct {
+	T  int64  `json:"t"`
+	D  int64  `json:"d"`
+	NS string `json:"ns"`
 }
 
 // ClusterInfo holds MongoDB instance / cluster metadata parsed from startup log lines.
@@ -70,6 +80,7 @@ type FileInfo struct {
 	WarnCount  int       `json:"warnCount"`
 	SlowCount  int       `json:"slowCount"`
 	TimeRange  TimeRange `json:"timeRange"`
+	Size       int64     `json:"size"`
 }
 
 type SlowQuery struct {
@@ -86,13 +97,13 @@ type SlowQuery struct {
 	AvgKeysExamined float64  `json:"avgKeysExamined"`
 	AvgNReturned    float64  `json:"avgNReturned"`
 	Inefficiency    float64  `json:"inefficiency"`
-	AvgResLen          float64  `json:"avgResLen"`
-	AvgNumYields       float64  `json:"avgNumYields"`
-	AvgRemoteWaitMs    float64  `json:"avgRemoteWaitMs"`
+	AvgRemoteWaitMs        float64  `json:"avgRemoteWaitMs"`
+	AvgPlanningTimeMicros  float64  `json:"avgPlanningTimeMicros"`
 	MaxRemoteWaitMs    int64    `json:"maxRemoteWaitMs"`
 	RemoteWaitPct      float64  `json:"remoteWaitPct"`  // avg remote wait / avg duration * 100
 	IsSharded          bool     `json:"isSharded"`
 	ExampleCommand     string   `json:"exampleCommand"`
+	LastRawLine        string   `json:"lastRawLine"`
 	Files              []string `json:"files"`
 }
 
@@ -123,10 +134,12 @@ type ReplEvent struct {
 
 // MessageGroup groups log lines by their exact `msg` field value.
 type MessageGroup struct {
-	Message   string `json:"message"`
-	Count     int    `json:"count"`
-	Component string `json:"component"` // most common component
-	Severity  string `json:"severity"`  // most common severity
+	Message   string    `json:"message"`
+	Count     int       `json:"count"`
+	Component string    `json:"component"` // most common component
+	Severity  string    `json:"severity"`  // most common severity
+	FirstTs   time.Time `json:"firstTs"`
+	LastTs    time.Time `json:"lastTs"`
 }
 
 type HourlyBucket struct {
@@ -161,6 +174,13 @@ type KV struct {
 	Value int    `json:"value"`
 }
 
+// MemberStateEvent is a single state transition for a replica set member.
+type MemberStateEvent struct {
+	Host      string    `json:"host"`
+	State     string    `json:"state"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // TimelineEvent represents a significant lifecycle or replication event on the timeline.
 type TimelineEvent struct {
 	Timestamp time.Time `json:"timestamp"`
@@ -184,6 +204,7 @@ type ConnStats struct {
 	TopUsers      []ConnUser   `json:"topUsers"`
 	TopApps       []ConnApp    `json:"topApps"`
 	Hourly        []ConnHourly `json:"hourly"`
+	Timeseries    []ConnPoint  `json:"timeseries"`
 }
 
 type ConnClient struct {
@@ -212,6 +233,12 @@ type ConnHourly struct {
 	Closed int    `json:"closed"`
 }
 
+// ConnPoint holds per-minute maximum connectionCount for the timeseries chart.
+type ConnPoint struct {
+	T string `json:"t"` // "2006-01-02T15:04"
+	V int64  `json:"v"` // max connectionCount seen in that minute
+}
+
 // ─── Internal accumulators ────────────────────────────────────────────────────
 
 type fileStats struct {
@@ -222,6 +249,7 @@ type fileStats struct {
 	SlowCount int
 	Start     time.Time
 	End       time.Time
+	Size      int64
 }
 
 type slowStats struct {
@@ -230,6 +258,7 @@ type slowStats struct {
 	CommandType        string
 	PlanSummary        string
 	ExampleCmd         string
+	LastRawLine        string
 	Count              int
 	MaxDuration        int64
 	MinDuration        int64
@@ -241,6 +270,7 @@ type slowStats struct {
 	TotalYields        int64
 	TotalRemoteWait    int64
 	MaxRemoteWait      int64
+	TotalPlanningMicros int64
 	ShardedCount       int   // entries where nShards > 0
 	Files              []string
 }
@@ -255,9 +285,11 @@ type errStats struct {
 }
 
 type msgStats struct {
-	Count     int
+	Count      int
 	CompCounts map[string]int
 	SevCounts  map[string]int
+	FirstTs    time.Time
+	LastTs     time.Time
 }
 
 type slowMinStats struct {
@@ -275,8 +307,6 @@ var durationBucketDefs = []struct {
 	min   int64
 	max   int64
 }{
-	{"0–50ms", 0, 50},
-	{"50–100ms", 50, 100},
 	{"100–250ms", 100, 250},
 	{"250–500ms", 250, 500},
 	{"500ms–1s", 500, 1000},
@@ -289,7 +319,7 @@ var durationBucketDefs = []struct {
 
 // ─── Analyze ──────────────────────────────────────────────────────────────────
 
-func analyze(entries []LogEntry) *Report {
+func analyze(entries []LogEntry, fileSizes map[string]int64) *Report {
 	report := &Report{
 		TotalEntries:    len(entries),
 		SeverityCounts:  make(map[string]int),
@@ -310,10 +340,12 @@ func analyze(entries []LogEntry) *Report {
 	planMap     := make(map[string]int)
 	durationCnt := make([]int, len(durationBucketDefs))
 	seenDrivers := make(map[string]bool)
+	var scatterRaw []SlowScatterPoint
 
 	// connection tracking
 	connClientMap  := make(map[string]int)
 	connHourMap    := make(map[string]*ConnHourly)
+	connTsMap      := make(map[string]int64)
 	var connPeak   int64
 	var connGSSAPI int
 
@@ -463,10 +495,18 @@ func analyze(entries []LogEntry) *Report {
 			ms.Count++
 			ms.CompCounts[e.Component]++
 			ms.SevCounts[e.Severity]++
+			if !e.Timestamp.IsZero() {
+				if ms.FirstTs.IsZero() || e.Timestamp.Before(ms.FirstTs) {
+					ms.FirstTs = e.Timestamp
+				}
+				if e.Timestamp.After(ms.LastTs) {
+					ms.LastTs = e.Timestamp
+				}
+			}
 		}
 
 		// ── slow query processing ──────────────────────────────────────────
-		if e.DurationMillis > 0 {
+		if e.DurationMillis > 0 && e.Message == "Slow query" {
 			fs.SlowCount++
 
 			// duration histogram bucket
@@ -514,6 +554,7 @@ func analyze(entries []LogEntry) *Report {
 			ss.TotalResLen  += e.ResLen
 			ss.TotalYields  += e.NumYields
 			ss.TotalRemoteWait += e.RemoteOpWaitMillis
+			ss.TotalPlanningMicros += e.PlanningTimeMicros
 			if e.RemoteOpWaitMillis > ss.MaxRemoteWait {
 				ss.MaxRemoteWait = e.RemoteOpWaitMillis
 			}
@@ -523,6 +564,10 @@ func analyze(entries []LogEntry) *Report {
 			ss.TotalDocs += e.DocsExamined
 			ss.TotalKeys += e.KeysExamined
 			ss.TotalReturned += e.NReturned
+			ss.LastRawLine = e.RawLine // always update → last occurrence
+			if !e.Timestamp.IsZero() {
+				scatterRaw = append(scatterRaw, SlowScatterPoint{T: e.Timestamp.UnixMilli(), D: e.DurationMillis, NS: e.Namespace})
+			}
 			if !containsStr(ss.Files, e.FileName) {
 				ss.Files = append(ss.Files, e.FileName)
 			}
@@ -562,6 +607,9 @@ func analyze(entries []LogEntry) *Report {
 					} else {
 						connHourMap[hour] = &ConnHourly{Hour: hour, Opened: 1}
 					}
+					if e.ConnectionCount > connTsMap[hour] {
+						connTsMap[hour] = e.ConnectionCount
+					}
 				}
 			case "Connection ended":
 				connClosed++
@@ -574,6 +622,9 @@ func analyze(entries []LogEntry) *Report {
 						ch.Closed++
 					} else {
 						connHourMap[hour] = &ConnHourly{Hour: hour, Closed: 1}
+					}
+					if e.ConnectionCount > connTsMap[hour] {
+						connTsMap[hour] = e.ConnectionCount
 					}
 				}
 			}
@@ -624,6 +675,13 @@ func analyze(entries []LogEntry) *Report {
 		// ── member state tracking ──────────────────────────────────────────
 		if e.MemberHost != "" && e.MemberState != "" {
 			memberStateMap[e.MemberHost] = e.MemberState
+			if !e.Timestamp.IsZero() {
+				report.MemberStateHistory = append(report.MemberStateHistory, MemberStateEvent{
+					Host:      e.MemberHost,
+					State:     e.MemberState,
+					Timestamp: e.Timestamp,
+				})
+			}
 		}
 
 		// ── replication events ─────────────────────────────────────────────
@@ -649,6 +707,7 @@ func analyze(entries []LogEntry) *Report {
 			WarnCount:  fs.Warnings,
 			SlowCount:  fs.SlowCount,
 			TimeRange:  TimeRange{Start: fs.Start, End: fs.End},
+			Size:       fileSizes[fs.Name],
 		})
 	}
 	sort.Slice(report.Files, func(i, j int) bool {
@@ -667,18 +726,18 @@ func analyze(entries []LogEntry) *Report {
 			MinDuration:    ss.MinDuration,
 			TotalDuration:  ss.TotalDuration,
 			ExampleCommand: ss.ExampleCmd,
+			LastRawLine:    ss.LastRawLine,
 			Files:          ss.Files,
 		}
 		if ss.Count > 0 {
-			sq.AvgDuration     = float64(ss.TotalDuration) / float64(ss.Count)
-			sq.AvgDocsExamined = float64(ss.TotalDocs) / float64(ss.Count)
-			sq.AvgKeysExamined = float64(ss.TotalKeys) / float64(ss.Count)
-			sq.AvgNReturned    = float64(ss.TotalReturned) / float64(ss.Count)
-			sq.Inefficiency    = float64(ss.TotalDocs) / float64(ss.TotalReturned+1)
-			sq.AvgResLen       = float64(ss.TotalResLen) / float64(ss.Count)
-			sq.AvgNumYields    = float64(ss.TotalYields) / float64(ss.Count)
-			sq.AvgRemoteWaitMs = float64(ss.TotalRemoteWait) / float64(ss.Count)
-			sq.MaxRemoteWaitMs = ss.MaxRemoteWait
+			sq.AvgDuration            = float64(ss.TotalDuration) / float64(ss.Count)
+			sq.AvgDocsExamined        = float64(ss.TotalDocs) / float64(ss.Count)
+			sq.AvgKeysExamined        = float64(ss.TotalKeys) / float64(ss.Count)
+			sq.AvgNReturned           = float64(ss.TotalReturned) / float64(ss.Count)
+			sq.Inefficiency           = float64(ss.TotalDocs) / float64(ss.TotalReturned+1)
+			sq.AvgRemoteWaitMs        = float64(ss.TotalRemoteWait) / float64(ss.Count)
+			sq.MaxRemoteWaitMs        = ss.MaxRemoteWait
+			sq.AvgPlanningTimeMicros  = float64(ss.TotalPlanningMicros) / float64(ss.Count)
 			if sq.AvgDuration > 0 && sq.AvgRemoteWaitMs > 0 {
 				sq.RemoteWaitPct = sq.AvgRemoteWaitMs / sq.AvgDuration * 100
 			}
@@ -689,6 +748,19 @@ func analyze(entries []LogEntry) *Report {
 	sort.Slice(report.SlowQueries, func(i, j int) bool {
 		return report.SlowQueries[i].MaxDuration > report.SlowQueries[j].MaxDuration
 	})
+
+	// ── scatter points: sort by time, sample down to 10k if needed ──────
+	sort.Slice(scatterRaw, func(i, j int) bool { return scatterRaw[i].T < scatterRaw[j].T })
+	const maxScatter = 10000
+	if len(scatterRaw) <= maxScatter {
+		report.SlowScatter = scatterRaw
+	} else {
+		step := len(scatterRaw) / maxScatter
+		report.SlowScatter = make([]SlowScatterPoint, 0, maxScatter)
+		for i := 0; i < len(scatterRaw); i += step {
+			report.SlowScatter = append(report.SlowScatter, scatterRaw[i])
+		}
+	}
 
 	// ── replication events: sort then deduplicate cross-node duplicates ────
 	sort.Slice(report.ReplEvents, func(i, j int) bool {
@@ -734,6 +806,8 @@ func analyze(entries []LogEntry) *Report {
 			Count:     ms.Count,
 			Component: topKey(ms.CompCounts),
 			Severity:  topKey(ms.SevCounts),
+			FirstTs:   ms.FirstTs,
+			LastTs:    ms.LastTs,
 		})
 	}
 	sort.Slice(report.MessageGroups, func(i, j int) bool {
@@ -850,6 +924,14 @@ func analyze(entries []LogEntry) *Report {
 		return connHourly[i].Hour < connHourly[j].Hour
 	})
 
+	var connTimeseries []ConnPoint
+	for t, v := range connTsMap {
+		connTimeseries = append(connTimeseries, ConnPoint{T: t, V: v})
+	}
+	sort.Slice(connTimeseries, func(i, j int) bool {
+		return connTimeseries[i].T < connTimeseries[j].T
+	})
+
 	var topUsers []ConnUser
 	for user, s := range authUserMap {
 		topUsers = append(topUsers, ConnUser{
@@ -888,6 +970,26 @@ func analyze(entries []LogEntry) *Report {
 		TopUsers:      topUsers,
 		TopApps:       topApps,
 		Hourly:        connHourly,
+		Timeseries:    connTimeseries,
+	}
+
+	// ── member state history: sort by time, then deduplicate ──────────────
+	// Multiple observers (other RS members) log the same state change, producing
+	// duplicate events. After sorting globally by time, we suppress any event
+	// where the host's state hasn't actually changed since its last recorded event.
+	sort.Slice(report.MemberStateHistory, func(i, j int) bool {
+		return report.MemberStateHistory[i].Timestamp.Before(report.MemberStateHistory[j].Timestamp)
+	})
+	{
+		lastState := make(map[string]string)
+		deduped := report.MemberStateHistory[:0]
+		for _, ev := range report.MemberStateHistory {
+			if lastState[ev.Host] != ev.State {
+				lastState[ev.Host] = ev.State
+				deduped = append(deduped, ev)
+			}
+		}
+		report.MemberStateHistory = deduped
 	}
 
 	// ── merge member states into cluster members ──────────────────────────

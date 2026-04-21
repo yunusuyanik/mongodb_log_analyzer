@@ -27,17 +27,18 @@ type LogEntry struct {
 	LineNum        int
 
 	// attr fields – query performance
-	DurationMillis int64
-	Namespace      string
-	CommandType    string
-	KeysExamined   int64
-	DocsExamined   int64
-	NReturned      int64
-	QueryHash      string
-	PlanSummary    string
-	NumYields      int64
-	ResLen         int64
-	RawCommand     string
+	DurationMillis      int64
+	Namespace           string
+	CommandType         string
+	KeysExamined        int64
+	DocsExamined        int64
+	NReturned           int64
+	QueryHash           string
+	PlanSummary         string
+	NumYields           int64
+	ResLen              int64
+	PlanningTimeMicros  int64
+	RawCommand          string
 
 	// attr fields – replication
 	NewPrimary string
@@ -104,6 +105,31 @@ func parseFiles(pattern string) ([]LogEntry, error) {
 		return nil, fmt.Errorf("no files matched: %s", pattern)
 	}
 	return parseConcurrent(files)
+}
+
+// GetFileSizes returns a map from display name to file size in bytes.
+func GetFileSizes(pattern string) map[string]int64 {
+	files, err := resolveFiles(pattern)
+	if err != nil {
+		return map[string]int64{}
+	}
+	sizes := make(map[string]int64, len(files))
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		base := filepath.Base(path)
+		lower := strings.ToLower(base)
+		displayName := base
+		if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") {
+			// tar archive: size is the archive itself; keyed by archive basename
+		} else if strings.HasSuffix(lower, ".gz") {
+			displayName = strings.TrimSuffix(base, ".gz")
+		}
+		sizes[displayName] = info.Size()
+	}
+	return sizes
 }
 
 func resolveFiles(pattern string) ([]string, error) {
@@ -311,6 +337,11 @@ func shouldSkipTarEntry(name string) bool {
 
 // ─── Core reader ──────────────────────────────────────────────────────────────
 
+// k8sMode controls whether the parser unwraps Kubernetes log envelopes.
+// Set this before calling parseFiles. It is safe to read from concurrent goroutines
+// because it is written exactly once in main() before any goroutine is started.
+var k8sMode bool
+
 // parseReader is the shared parsing kernel. It reads lines from any io.Reader
 // and parses each JSON log line. displayName is used in LogEntry.FileName.
 func parseReader(r io.Reader, displayName string) ([]LogEntry, error) {
@@ -326,6 +357,15 @@ func parseReader(r io.Reader, displayName string) ([]LogEntry, error) {
 		line := scanner.Text()
 		if len(line) == 0 || line[0] != '{' {
 			continue
+		}
+		if k8sMode {
+			// K8s log envelope: {"file":"...","log":"{...mongodb json...}"}
+			// Unwrap the inner log string before parsing.
+			inner := gjson.Get(line, "log").String()
+			if inner == "" {
+				continue
+			}
+			line = inner
 		}
 		if entry, ok := parseLine(line, displayName, lineNum); ok {
 			entries = append(entries, entry)
@@ -376,8 +416,9 @@ func parseLine(line, fileName string, lineNum int) (LogEntry, bool) {
 		entry.NReturned      = attr.Get("nreturned").Int()
 		entry.QueryHash      = attr.Get("queryHash").String()
 		entry.PlanSummary    = attr.Get("planSummary").String()
-		entry.NumYields      = attr.Get("numYields").Int()
-		entry.ResLen         = attr.Get("reslen").Int()
+		entry.NumYields            = attr.Get("numYields").Int()
+		entry.ResLen               = attr.Get("reslen").Int()
+		entry.PlanningTimeMicros   = attr.Get("planningTimeMicros").Int()
 
 		if cmd := attr.Get("command"); cmd.Exists() {
 			entry.RawCommand = cmd.Raw

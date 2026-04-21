@@ -9,14 +9,17 @@ import (
 func main() {
 	path := flag.String("path", ".", "directory path or glob pattern (e.g. logs/ or 'logs/mongo*.tar.gz')")
 	// keep -dir as alias for backward compat
-	dir := flag.String("dir", "", "alias for -path (directory)")
+	dir  := flag.String("dir", "", "alias for -path (directory)")
 	port := flag.Int("port", 8080, "web server port")
+	k8s  := flag.Bool("k8s", false, "parse Kubernetes log format (lines wrapped as {\"file\":\"...\",\"log\":\"...\"})")
 	flag.Parse()
 
 	target := *path
 	if *dir != "" {
 		target = *dir
 	}
+
+	k8sMode = *k8s
 
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("  MongoDB Log Analyzer")
@@ -35,7 +38,8 @@ func main() {
 	fmt.Printf("\n  Total entries parsed: %d\n", len(entries))
 	fmt.Println("  Analyzing...")
 
-	report := analyze(entries)
+	fileSizes := GetFileSizes(target)
+	report := analyze(entries, fileSizes)
 
 	fmt.Printf("  Slow queries found: %d unique patterns\n", len(report.SlowQueries))
 	fmt.Printf("  Replication events: %d\n", len(report.ReplEvents))
