@@ -476,7 +476,8 @@ const SlowQueriesPage = ({data}) => {
   const maxDur    = qs.reduce((a,q)=>Math.max(a,q.maxDuration),0);
   const collscans = plans.find(p=>p.key==='COLLSCAN')?.value||0;
 
-  const sorted = useMemo(()=>[...qs].sort((a,b)=>(a[sortKey]>b[sortKey]?1:-1)*sortDir),[qs,sortKey,sortDir]);
+  const sorted   = useMemo(()=>[...qs].sort((a,b)=>(a[sortKey]>b[sortKey]?1:-1)*sortDir),[qs,sortKey,sortDir]);
+  const filtered = useMemo(()=>collscanOnly ? sorted.filter(q=>q.planSummary?.includes('COLLSCAN')) : sorted,[sorted,collscanOnly]);
   const toggleSort = k => { if(k===sortKey) setSortDir(d=>-d); else {setSortKey(k);setSortDir(-1);} };
 
   const scatterOpt = useMemo(()=>({
@@ -600,7 +601,18 @@ const SlowQueriesPage = ({data}) => {
 
       {qs.length>0 && (
         <Card>
-          <CardHead title="Query patterns" sub={`${qs.length} unique — click to expand`}/>
+          <CardHead
+            title="Query patterns"
+            sub={collscanOnly ? `${filtered.length} COLLSCAN — click to expand` : `${qs.length} unique — click to expand`}
+            action={
+              <button onClick={()=>{ setCollscanOnly(v=>!v); setDetail(null); }} style={{
+                padding:'3px 10px', fontSize:10, borderRadius:4, cursor:'pointer',
+                border:`1px solid ${collscanOnly?RED:BORDER}`,
+                background:collscanOnly?RED+'1a':'transparent',
+                color:collscanOnly?RED:MUTED, fontWeight:500,
+              }}>COLLSCAN</button>
+            }
+          />
           <div style={{overflowX:'auto'}}>
             <table>
               <thead>
@@ -611,7 +623,7 @@ const SlowQueriesPage = ({data}) => {
                 </tr>
               </thead>
               <tbody>
-                {sorted.map((q,i)=>(
+                {filtered.map((q,i)=>(
                   <React.Fragment key={i}>
                     <TRow onClick={()=>setDetail(detail===i?null:i)} active={detail===i}>
                       <Td mono style={{color:TEXT,maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{q.namespace||'—'}</Td>
